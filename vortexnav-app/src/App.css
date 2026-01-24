@@ -1,0 +1,502 @@
+/* VortexNav Main Styles */
+
+/* CSS Variables for theming */
+:root {
+  /* Day theme (default) */
+  --bg-primary: #f5f5f5;
+  --bg-secondary: #ffffff;
+  --bg-header: #1a365d;
+  --text-primary: #1a202c;
+  --text-secondary: #4a5568;
+  --text-header: #ffffff;
+  --accent: #3182ce;
+  --border: #e2e8f0;
+  --success: #38a169;
+  --warning: #d69e2e;
+  --danger: #e53e3e;
+}
+
+.app--dusk {
+  --bg-primary: #2d3748;
+  --bg-secondary: #4a5568;
+  --bg-header: #1a202c;
+  --text-primary: #e2e8f0;
+  --text-secondary: #a0aec0;
+  --text-header: #e2e8f0;
+  --accent: #63b3ed;
+  --border: #4a5568;
+  --success: #68d391;
+  --warning: #f6e05e;
+  --danger: #fc8181;
+}
+
+.app--night {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-header: #0f0f1a;
+  --text-primary: #ff6b6b;
+  --text-secondary: #cc5555;
+  --text-header: #ff6b6b;
+  --accent: #ff8080;
+  --border: #2d2d44;
+  --success: #68d391;
+  --warning: #f6e05e;
+  --danger: #ff6b6b;
+}
+
+/* Reset and base */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* App layout */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Header */
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: var(--bg-header);
+  color: var(--text-header);
+  height: 48px;
+  flex-shrink: 0;
+  z-index: 100;
+}
+
+.app__title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.app__version {
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+
+/* Main content (map) */
+.app__main {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.map-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+
+/* Footer / Status bar */
+.app__footer {
+  flex-shrink: 0;
+  z-index: 100;
+}
+
+/* Status Bar Styles */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  height: 56px;
+  gap: 1rem;
+  transition: background-color 0.3s ease;
+}
+
+.status-bar__section {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status-bar__position {
+  flex: 1;
+}
+
+.status-bar__navigation {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.status-bar__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.status-bar__label {
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin-bottom: 0.125rem;
+}
+
+.status-bar__value {
+  font-size: 0.875rem;
+  font-weight: 600;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  color: var(--text-primary);
+}
+
+.status-bar__controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.status-bar__connection {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.connection-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.connection-indicator.connected {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+
+/* Theme switcher */
+.theme-switcher {
+  display: flex;
+  gap: 0.25rem;
+  background: var(--bg-primary);
+  border-radius: 6px;
+  padding: 0.25rem;
+}
+
+.theme-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: background-color 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.theme-btn:hover {
+  background: var(--border);
+}
+
+.theme-btn.active {
+  background: var(--accent);
+}
+
+/* MapLibre overrides */
+.maplibregl-ctrl-attrib {
+  font-size: 10px !important;
+}
+
+.app--night .maplibregl-ctrl-attrib {
+  background: rgba(26, 26, 46, 0.8) !important;
+  color: var(--text-secondary) !important;
+}
+
+.app--night .maplibregl-ctrl-attrib a {
+  color: var(--accent) !important;
+}
+
+.maplibregl-ctrl-scale {
+  background: var(--bg-secondary) !important;
+  border-color: var(--text-secondary) !important;
+  color: var(--text-primary) !important;
+  font-size: 11px !important;
+}
+
+/* Touch-friendly controls */
+@media (pointer: coarse) {
+  .theme-btn {
+    width: 44px;
+    height: 44px;
+    font-size: 1.25rem;
+  }
+
+  .status-bar {
+    height: 64px;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .status-bar__value {
+    font-size: 1rem;
+  }
+}
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .status-bar__navigation {
+    gap: 1rem;
+  }
+
+  .status-bar__position .status-bar__value {
+    font-size: 0.75rem;
+  }
+}
+
+/* Layer Switcher */
+.layer-switcher {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 50;
+}
+
+.layer-switcher__toggle {
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  transition: background-color 0.2s ease;
+}
+
+.layer-switcher__toggle:hover {
+  background: var(--border);
+}
+
+.layer-switcher__panel {
+  position: absolute;
+  top: 48px;
+  left: 0;
+  width: 260px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  padding: 0.75rem;
+  max-height: calc(100vh - 200px);
+  overflow-y: auto;
+}
+
+.layer-switcher__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.layer-switcher__header h3 {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.layer-switcher__settings-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.layer-switcher__settings-btn:hover {
+  background: var(--border);
+}
+
+.layer-switcher__basemaps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.basemap-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.basemap-option:hover:not(.disabled) {
+  background: var(--border);
+}
+
+.basemap-option.active {
+  border-color: var(--accent);
+  background: rgba(49, 130, 206, 0.1);
+}
+
+.basemap-option.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.basemap-option__name {
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.basemap-option__badge {
+  font-size: 0.625rem;
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
+  background: var(--accent);
+  color: white;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.basemap-option__badge--key {
+  background: var(--warning);
+  color: #1a202c;
+}
+
+.layer-switcher__overlays {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.layer-switcher__overlays h4 {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.5rem;
+}
+
+.overlay-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+}
+
+.overlay-toggle input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+/* Settings panel */
+.layer-switcher__settings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.settings-field label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.settings-field input {
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+}
+
+.settings-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.settings-field small {
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.settings-field small a {
+  color: var(--accent);
+}
+
+.settings-save-btn {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 0.5rem;
+}
+
+.settings-save-btn:hover {
+  opacity: 0.9;
+}
+
+/* Touch-friendly layer switcher */
+@media (pointer: coarse) {
+  .layer-switcher__toggle {
+    width: 48px;
+    height: 48px;
+  }
+
+  .layer-switcher__panel {
+    width: 280px;
+  }
+
+  .basemap-option {
+    padding: 0.75rem;
+  }
+}
