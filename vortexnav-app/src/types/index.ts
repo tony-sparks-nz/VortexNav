@@ -96,3 +96,45 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     offline: false,
   },
 ];
+
+// MBTiles metadata from backend
+export interface MBTilesMetadata {
+  name: string | null;
+  format: string | null;
+  bounds: string | null;
+  center: string | null;
+  minzoom: number | null;
+  maxzoom: number | null;
+  description: string | null;
+}
+
+// Chart info returned from list_charts
+export interface ChartInfo {
+  id: string;
+  name: string;
+  path: string;
+  metadata: MBTilesMetadata;
+}
+
+// Chart layer state for persistence
+export interface ChartLayerState {
+  chartId: string;
+  enabled: boolean;
+  opacity: number;
+  zOrder: number;
+}
+
+// Full chart layer with chart info and state combined
+export interface ChartLayer {
+  id: string;
+  chartId: string;
+  name: string;
+  type: 'raster' | 'vector';
+  format: string;
+  enabled: boolean;
+  opacity: number;
+  zOrder: number;
+  bounds?: [number, number, number, number]; // [minLon, minLat, maxLon, maxLat]
+  minZoom?: number;
+  maxZoom?: number;
+}

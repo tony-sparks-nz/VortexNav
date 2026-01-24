@@ -1,15 +1,24 @@
 import { useState } from 'react';
-import type { BasemapProvider, ApiKeys, ThemeMode } from '../types';
+import type { BasemapProvider, ApiKeys, ThemeMode, ChartLayer } from '../types';
 import { BASEMAP_OPTIONS } from '../types';
+import { ChartLayerItem } from './ChartLayerItem';
 
 interface LayerSwitcherProps {
   theme: ThemeMode;
   currentBasemap: BasemapProvider;
   showOpenSeaMap: boolean;
   apiKeys: ApiKeys;
+  chartLayers: ChartLayer[];
+  chartLayersLoading: boolean;
   onBasemapChange: (basemap: BasemapProvider) => void;
   onOpenSeaMapToggle: (show: boolean) => void;
   onApiKeysChange: (keys: ApiKeys) => void;
+  onAddChart: () => void;
+  onRemoveChart: (chartId: string) => void;
+  onToggleChart: (chartId: string) => void;
+  onChartOpacity: (chartId: string, opacity: number) => void;
+  onZoomToChart: (chartId: string) => void;
+  onClose: () => void;
 }
 
 export function LayerSwitcher({
@@ -17,11 +26,18 @@ export function LayerSwitcher({
   currentBasemap,
   showOpenSeaMap,
   apiKeys,
+  chartLayers,
+  chartLayersLoading,
   onBasemapChange,
   onOpenSeaMapToggle,
   onApiKeysChange,
+  onAddChart,
+  onRemoveChart,
+  onToggleChart,
+  onChartOpacity,
+  onZoomToChart,
+  onClose,
 }: LayerSwitcherProps) {
-  const [isOpen, setIsOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [tempEsriKey, setTempEsriKey] = useState(apiKeys.esri || '');
 
@@ -42,37 +58,33 @@ export function LayerSwitcher({
   const hasApiKeyOptions = BASEMAP_OPTIONS.some(opt => opt.requiresApiKey);
 
   return (
-    <div className={`layer-switcher layer-switcher--${theme}`}>
-      <button
-        className="layer-switcher__toggle"
-        onClick={() => setIsOpen(!isOpen)}
-        title="Layers"
-      >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <polygon points="12 2 2 7 12 12 22 7 12 2" />
-          <polyline points="2 17 12 22 22 17" />
-          <polyline points="2 12 12 17 22 12" />
-        </svg>
-      </button>
+    <div className={`layer-panel layer-panel--${theme}`}>
+      <div className="layer-panel__header">
+        <h2>Layers</h2>
+        <button className="layer-panel__close" onClick={onClose}>×</button>
+      </div>
 
-      {isOpen && (
-        <div className="layer-switcher__panel">
-          <div className="layer-switcher__header">
+      <div className="layer-panel__content">
+        <div className="layer-panel__section">
+          <div className="layer-panel__section-header">
             <h3>Basemap</h3>
             {hasApiKeyOptions && (
               <button
-                className="layer-switcher__settings-btn"
+                className="layer-panel__settings-btn"
                 onClick={() => setShowSettings(!showSettings)}
                 title="API Settings"
               >
-                ⚙
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
               </button>
             )}
           </div>
 
           {showSettings ? (
-            <div className="layer-switcher__settings">
-              <div className="settings-field">
+            <div className="layer-panel__settings">
+              <div className="layer-panel__field">
                 <label>Esri API Key (optional)</label>
                 <input
                   type="password"
@@ -88,13 +100,13 @@ export function LayerSwitcher({
                 </small>
               </div>
 
-              <button className="settings-save-btn" onClick={handleSaveKeys}>
+              <button className="layer-panel__save-btn" onClick={handleSaveKeys}>
                 Save
               </button>
             </div>
           ) : (
             <>
-              <div className="layer-switcher__basemaps">
+              <div className="layer-panel__basemaps">
                 {BASEMAP_OPTIONS.map((option) => {
                   const available = isBasemapAvailable(option);
                   const needsKey = option.requiresApiKey && !available;
@@ -115,7 +127,7 @@ export function LayerSwitcher({
                 })}
               </div>
 
-              <div className="layer-switcher__overlays">
+              <div className="layer-panel__overlays">
                 <h4>Overlays</h4>
                 <label className="overlay-toggle">
                   <input
@@ -129,7 +141,45 @@ export function LayerSwitcher({
             </>
           )}
         </div>
-      )}
+
+        {/* Offline Charts Section */}
+        <div className="layer-panel__section layer-panel__charts">
+          <div className="layer-panel__section-header">
+            <h3>Offline Charts</h3>
+            <button
+              className="layer-panel__add-btn"
+              onClick={onAddChart}
+              title="Import MBTiles chart"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+          </div>
+
+          {chartLayersLoading ? (
+            <div className="layer-panel__loading">Loading charts...</div>
+          ) : chartLayers.length === 0 ? (
+            <div className="layer-panel__empty">
+              No charts loaded. Click + to import MBTiles files.
+            </div>
+          ) : (
+            <div className="layer-panel__chart-list">
+              {chartLayers.map((layer) => (
+                <ChartLayerItem
+                  key={layer.id}
+                  layer={layer}
+                  theme={theme}
+                  onToggle={() => onToggleChart(layer.chartId)}
+                  onOpacityChange={(opacity) => onChartOpacity(layer.chartId, opacity)}
+                  onZoomTo={() => onZoomToChart(layer.chartId)}
+                  onRemove={() => onRemoveChart(layer.chartId)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -335,6 +335,65 @@ export async function getChartsDirectory(): Promise<string> {
   return result.data;
 }
 
+export async function importChart(sourcePath: string): Promise<ChartInfo> {
+  const result = await invoke<CommandResult<ChartInfo>>('import_chart', { sourcePath });
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to import chart');
+  }
+  return result.data;
+}
+
+export async function removeChart(chartId: string): Promise<void> {
+  const result = await invoke<CommandResult<null>>('remove_chart', { chartId });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to remove chart');
+  }
+}
+
+// Chart layer state for persistence
+export interface ChartLayerStateInput {
+  chartId: string;
+  enabled: boolean;
+  opacity: number;
+  zOrder: number;
+}
+
+// Chart layer state from backend (uses snake_case)
+export interface ChartLayerStateBackend {
+  chart_id: string;
+  enabled: boolean;
+  opacity: number;
+  z_order: number;
+}
+
+export async function saveChartLayerState(layerState: ChartLayerStateInput): Promise<void> {
+  // Convert to backend format (snake_case)
+  const backendState = {
+    chart_id: layerState.chartId,
+    enabled: layerState.enabled,
+    opacity: layerState.opacity,
+    z_order: layerState.zOrder,
+  };
+  const result = await invoke<CommandResult<null>>('save_chart_layer_state', { layerState: backendState });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to save chart layer state');
+  }
+}
+
+export async function getChartLayerStates(): Promise<ChartLayerStateInput[]> {
+  const result = await invoke<CommandResult<ChartLayerStateBackend[]>>('get_chart_layer_states');
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to get chart layer states');
+  }
+  // Convert from backend format to frontend format
+  return result.data.map((state) => ({
+    chartId: state.chart_id,
+    enabled: state.enabled,
+    opacity: state.opacity,
+    zOrder: state.z_order,
+  }));
+}
+
 // ============ Utility Commands ============
 
 export async function getAppDataDir(): Promise<string> {

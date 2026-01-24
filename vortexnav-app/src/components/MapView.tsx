@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel } from '../types';
+import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel, ChartLayer } from '../types';
 import type { Waypoint } from '../hooks/useTauri';
+import { registerMBTilesProtocol } from '../utils/mbtilesProtocol';
 
 interface ContextMenuState {
   visible: boolean;
@@ -30,6 +31,9 @@ interface MapViewProps {
   waypoints?: Waypoint[];
   activeWaypointId?: number | null;
   pendingWaypoint?: { lat: number; lon: number } | null;
+  orientationMode?: 'north-up' | 'heading-up';
+  chartLayers?: ChartLayer[];
+  onOrientationModeChange?: (mode: 'north-up' | 'heading-up') => void;
   onMapReady?: (map: maplibregl.Map) => void;
   onMapRightClick?: (lat: number, lon: number) => void;
   onWaypointClick?: (waypoint: Waypoint) => void;
@@ -261,6 +265,9 @@ export function MapView({
   waypoints = [],
   activeWaypointId,
   pendingWaypoint,
+  orientationMode = 'north-up',
+  chartLayers = [],
+  onOrientationModeChange,
   onMapReady,
   onMapRightClick,
   onWaypointClick,
@@ -277,6 +284,8 @@ export function MapView({
   const waypointMarkersRef = useRef<Map<number, maplibregl.Marker>>(new Map());
   const pendingMarkerRef = useRef<maplibregl.Marker | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+  // Track style version to re-add chart layers after style changes
+  const [styleVersion, setStyleVersion] = useState(0);
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
@@ -307,6 +316,7 @@ export function MapView({
   const onWaypointClickRef = useRef(onWaypointClick);
   const onWaypointDeleteRef = useRef(onWaypointDelete);
   const onWaypointDragRef = useRef(onWaypointDrag);
+  const onOrientationModeChangeRef = useRef(onOrientationModeChange);
   onCursorMoveRef.current = onCursorMove;
   onCursorLeaveRef.current = onCursorLeave;
   onMapRightClickRef.current = onMapRightClick;
@@ -315,6 +325,7 @@ export function MapView({
   onWaypointClickRef.current = onWaypointClick;
   onWaypointDeleteRef.current = onWaypointDelete;
   onWaypointDragRef.current = onWaypointDrag;
+  onOrientationModeChangeRef.current = onOrientationModeChange;
 
   // Initialize map
   useEffect(() => {
@@ -362,6 +373,9 @@ export function MapView({
       }),
       'bottom-left'
     );
+
+    // Register custom mbtiles:// protocol for local tile serving
+    registerMBTilesProtocol();
 
     map.on('load', () => {
       setMapLoaded(true);
@@ -467,8 +481,115 @@ export function MapView({
   // Update style when basemap, theme, overlays, or API keys change
   useEffect(() => {
     if (!mapRef.current || !mapLoaded) return;
-    mapRef.current.setStyle(buildMapStyle(basemap, theme, showOpenSeaMap, apiKeys));
+
+    const map = mapRef.current;
+
+    // Listen for style.load to re-add chart layers after style change
+    const handleStyleLoad = () => {
+      // Clear tracked layer IDs since they were removed with the style change
+      activeChartLayerIdsRef.current = new Set();
+      // Increment style version to trigger chart layers re-add
+      setStyleVersion(v => v + 1);
+    };
+
+    map.once('style.load', handleStyleLoad);
+    map.setStyle(buildMapStyle(basemap, theme, showOpenSeaMap, apiKeys));
+
+    return () => {
+      map.off('style.load', handleStyleLoad);
+    };
   }, [basemap, theme, showOpenSeaMap, apiKeys.esri, mapLoaded]);
+
+  // Track active chart layer IDs for cleanup
+  const activeChartLayerIdsRef = useRef<Set<string>>(new Set());
+
+  // Manage MBTiles chart layers
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+
+    // Ensure style is loaded before adding layers
+    if (!map.isStyleLoaded()) {
+      console.debug('MapView: Style not loaded, skipping chart layer update');
+      return;
+    }
+
+    console.debug('MapView: Processing chart layers', {
+      count: chartLayers.length,
+      styleVersion,
+      enabledLayers: chartLayers.filter(l => l.enabled).map(l => l.chartId)
+    });
+
+    const currentLayerIds = activeChartLayerIdsRef.current;
+    const newLayerIds = new Set<string>();
+
+    // Process each chart layer
+    chartLayers.forEach((layer) => {
+      const sourceId = `mbtiles-${layer.chartId}`;
+      const layerId = `mbtiles-layer-${layer.chartId}`;
+
+      if (layer.enabled) {
+        newLayerIds.add(layer.chartId);
+
+        // Add source if not exists
+        if (!map.getSource(sourceId)) {
+          console.debug(`MapView: Adding source ${sourceId}`, {
+            tiles: `mbtiles://${layer.chartId}/{z}/{x}/{y}`,
+            minZoom: layer.minZoom,
+            maxZoom: layer.maxZoom
+          });
+          map.addSource(sourceId, {
+            type: 'raster',
+            tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
+            tileSize: 256,
+            minzoom: layer.minZoom ?? 0,
+            maxzoom: layer.maxZoom ?? 22,
+          });
+        }
+
+        // Add layer if not exists
+        if (!map.getLayer(layerId)) {
+          // Insert before OpenSeaMap overlay if it exists, otherwise add to top
+          const beforeLayerId = map.getLayer('openseamap-overlay') ? 'openseamap-overlay' : undefined;
+
+          console.debug(`MapView: Adding layer ${layerId}`, {
+            beforeLayerId,
+            opacity: layer.opacity
+          });
+          map.addLayer({
+            id: layerId,
+            type: 'raster',
+            source: sourceId,
+            paint: {
+              'raster-opacity': layer.opacity,
+            },
+          }, beforeLayerId);
+        } else {
+          // Update opacity if layer already exists
+          map.setPaintProperty(layerId, 'raster-opacity', layer.opacity);
+        }
+      }
+    });
+
+    // Remove layers that are no longer enabled
+    currentLayerIds.forEach((chartId) => {
+      if (!newLayerIds.has(chartId)) {
+        const layerId = `mbtiles-layer-${chartId}`;
+        const sourceId = `mbtiles-${chartId}`;
+
+        if (map.getLayer(layerId)) {
+          map.removeLayer(layerId);
+        }
+        if (map.getSource(sourceId)) {
+          map.removeSource(sourceId);
+        }
+      }
+    });
+
+    // Update ref with current layer IDs
+    activeChartLayerIdsRef.current = newLayerIds;
+  }, [chartLayers, mapLoaded, styleVersion]);
 
   // Update center when it changes
   useEffect(() => {
@@ -530,6 +651,24 @@ export function MapView({
       .setRotation(rotation)
       .addTo(mapRef.current!);
   }, [theme]);
+
+  // Rotate map in heading-up mode based on vessel heading/COG
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    if (orientationMode === 'heading-up') {
+      // Use heading if available, otherwise COG
+      const heading = vessel?.heading ?? vessel?.cog;
+      if (heading !== null && heading !== undefined) {
+        // In heading-up mode, rotate map so vessel heading points up
+        // MapLibre bearing is clockwise from north, so we negate the heading
+        mapRef.current.setBearing(-heading);
+      }
+    } else {
+      // North-up mode: reset bearing to 0
+      mapRef.current.setBearing(0);
+    }
+  }, [orientationMode, vessel?.heading, vessel?.cog, mapLoaded]);
 
   // Manage waypoint markers
   useEffect(() => {
@@ -906,6 +1045,12 @@ export function MapView({
     handleCloseContextMenu();
   };
 
+  // Toggle orientation mode
+  const handleOrientationToggle = () => {
+    const newMode = orientationMode === 'north-up' ? 'heading-up' : 'north-up';
+    onOrientationModeChangeRef.current?.(newMode);
+  };
+
   return (
     <div
       ref={mapContainer}
@@ -913,6 +1058,29 @@ export function MapView({
       style={{ width: '100%', height: '100%', position: 'relative' }}
       onClick={handleCloseContextMenu}
     >
+      {/* Orientation Mode Toggle Button */}
+      <button
+        className={`orientation-toggle orientation-toggle--${orientationMode}`}
+        onClick={handleOrientationToggle}
+        title={orientationMode === 'north-up' ? 'Switch to Heading Up' : 'Switch to North Up'}
+      >
+        {orientationMode === 'north-up' ? (
+          // North Up icon - compass pointing north
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="10" />
+            <polygon points="12,2 14,10 12,8 10,10" fill="currentColor" stroke="none" />
+            <text x="12" y="17" textAnchor="middle" fontSize="6" fill="currentColor" stroke="none" fontWeight="bold">N</text>
+          </svg>
+        ) : (
+          // Heading Up icon - boat/arrow pointing up
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 6 L16 14 L12 12 L8 14 Z" fill="currentColor" stroke="none" />
+            <text x="12" y="20" textAnchor="middle" fontSize="5" fill="currentColor" stroke="none" fontWeight="bold">HDG</text>
+          </svg>
+        )}
+      </button>
+
       {/* Context Menu */}
       {contextMenu.visible && (
         <div

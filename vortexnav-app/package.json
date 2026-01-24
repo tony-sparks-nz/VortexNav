@@ -12,6 +12,7 @@
   "dependencies": {
     "@esri/arcgis-rest-request": "^4.8.0",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2",
     "@types/maplibre-gl": "^1.13.2",
     "maplibre-gl": "^5.16.0",

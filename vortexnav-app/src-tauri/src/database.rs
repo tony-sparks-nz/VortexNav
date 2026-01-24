@@ -90,6 +90,15 @@ pub struct MBTilesMetadata {
     pub description: Option<String>,
 }
 
+// Chart layer state for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartLayerState {
+    pub chart_id: String,
+    pub enabled: bool,
+    pub opacity: f64,
+    pub z_order: i32,
+}
+
 // Configuration database manager
 pub struct ConfigDatabase {
     conn: Mutex<Connection>,
@@ -182,6 +191,17 @@ impl ConfigDatabase {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+
+        // Chart layer state - stores user preferences for each chart layer
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chart_layers (
+                chart_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                opacity REAL NOT NULL DEFAULT 1.0,
+                z_order INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -369,6 +389,74 @@ impl ConfigDatabase {
         conn.execute(
             "UPDATE gps_sources SET priority = ? WHERE id = ?",
             params![priority, id],
+        )?;
+        Ok(())
+    }
+
+    // Chart layer state methods
+    pub fn save_chart_layer_state(&self, state: &ChartLayerState) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO chart_layers (chart_id, enabled, opacity, z_order)
+             VALUES (?, ?, ?, ?)",
+            params![
+                state.chart_id,
+                if state.enabled { 1 } else { 0 },
+                state.opacity,
+                state.z_order
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_chart_layer_states(&self) -> SqliteResult<Vec<ChartLayerState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chart_id, enabled, opacity, z_order FROM chart_layers ORDER BY z_order ASC"
+        )?;
+        let states = stmt.query_map([], |row| {
+            Ok(ChartLayerState {
+                chart_id: row.get(0)?,
+                enabled: row.get::<_, i32>(1)? == 1,
+                opacity: row.get(2)?,
+                z_order: row.get(3)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(states)
+    }
+
+    pub fn get_chart_layer_state(&self, chart_id: &str) -> SqliteResult<Option<ChartLayerState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chart_id, enabled, opacity, z_order FROM chart_layers WHERE chart_id = ?"
+        )?;
+        let result = stmt.query_row([chart_id], |row| {
+            Ok(ChartLayerState {
+                chart_id: row.get(0)?,
+                enabled: row.get::<_, i32>(1)? == 1,
+                opacity: row.get(2)?,
+                z_order: row.get(3)?,
+            })
+        });
+        match result {
+            Ok(state) => Ok(Some(state)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn delete_chart_layer_state(&self, chart_id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM chart_layers WHERE chart_id = ?", params![chart_id])?;
+        Ok(())
+    }
+
+    pub fn delete_mbtiles_registry(&self, chart_id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Delete by file name (chart_id is the file stem)
+        conn.execute(
+            "DELETE FROM mbtiles_registry WHERE file_path LIKE ?",
+            params![format!("%{}.mbtiles", chart_id)],
         )?;
         Ok(())
     }

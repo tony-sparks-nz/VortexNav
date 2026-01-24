@@ -1,6 +1,6 @@
 // Tauri commands for frontend communication
 
-use crate::database::{AppSettings, ConfigDatabase, GpsSourceRecord, MBTilesMetadata, MBTilesReader, Waypoint};
+use crate::database::{AppSettings, ChartLayerState, ConfigDatabase, GpsSourceRecord, MBTilesMetadata, MBTilesReader, Waypoint};
 use crate::gps::{DetectedPort, GpsManager, GpsSourceConfig, GpsSourceStatus, GpsSourceType};
 use crate::nmea::GpsData;
 use serde::{Deserialize, Serialize};
@@ -321,6 +321,147 @@ pub fn get_tile(
 #[tauri::command]
 pub fn get_charts_directory(state: State<AppState>) -> CommandResult<String> {
     CommandResult::ok(state.charts_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn import_chart(source_path: String, state: State<AppState>) -> CommandResult<ChartInfo> {
+    let source = std::path::Path::new(&source_path);
+
+    // Validate source file exists
+    if !source.exists() {
+        return CommandResult::err(&format!("Source file not found: {}", source_path));
+    }
+
+    // Validate it's an mbtiles file
+    if source.extension().map_or(true, |ext| ext != "mbtiles") {
+        return CommandResult::err("File must have .mbtiles extension");
+    }
+
+    // Validate it's a valid MBTiles database
+    let reader = match MBTilesReader::open(&source_path) {
+        Ok(r) => r,
+        Err(e) => return CommandResult::err(&format!("Invalid MBTiles file: {}", e)),
+    };
+
+    let metadata = match reader.get_metadata() {
+        Ok(m) => m,
+        Err(e) => return CommandResult::err(&format!("Failed to read MBTiles metadata: {}", e)),
+    };
+
+    // Get file name for destination
+    let file_name = source.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}.mbtiles", uuid::Uuid::new_v4()));
+
+    let dest_path = state.charts_dir.join(&file_name);
+
+    // Check if file already exists in charts directory
+    if dest_path.exists() {
+        // File already exists, just return its info
+        let id = dest_path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let name = metadata.name.clone().unwrap_or_else(|| id.clone());
+
+        return CommandResult::ok(ChartInfo {
+            id,
+            name,
+            path: dest_path.to_string_lossy().to_string(),
+            metadata,
+        });
+    }
+
+    // Copy file to charts directory
+    if let Err(e) = std::fs::copy(&source_path, &dest_path) {
+        return CommandResult::err(&format!("Failed to copy chart file: {}", e));
+    }
+
+    let id = dest_path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let name = metadata.name.clone().unwrap_or_else(|| id.clone());
+
+    // Create default layer state
+    let layer_state = ChartLayerState {
+        chart_id: id.clone(),
+        enabled: true,
+        opacity: 1.0,
+        z_order: 0,
+    };
+
+    if let Err(e) = state.config_db.save_chart_layer_state(&layer_state) {
+        log::warn!("Failed to save chart layer state: {}", e);
+    }
+
+    CommandResult::ok(ChartInfo {
+        id,
+        name,
+        path: dest_path.to_string_lossy().to_string(),
+        metadata,
+    })
+}
+
+#[tauri::command]
+pub fn remove_chart(chart_id: String, state: State<AppState>) -> CommandResult<()> {
+    let chart_path = state.charts_dir.join(format!("{}.mbtiles", chart_id));
+
+    // Remove from cache first
+    {
+        let mut readers = state.mbtiles_readers.lock().unwrap();
+        readers.remove(&chart_id);
+    }
+
+    // Delete the file
+    if chart_path.exists() {
+        if let Err(e) = std::fs::remove_file(&chart_path) {
+            return CommandResult::err(&format!("Failed to delete chart file: {}", e));
+        }
+    }
+
+    // Delete layer state
+    if let Err(e) = state.config_db.delete_chart_layer_state(&chart_id) {
+        log::warn!("Failed to delete chart layer state: {}", e);
+    }
+
+    // Delete from registry
+    if let Err(e) = state.config_db.delete_mbtiles_registry(&chart_id) {
+        log::warn!("Failed to delete chart registry entry: {}", e);
+    }
+
+    CommandResult::ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChartLayerStateInput {
+    pub chart_id: String,
+    pub enabled: bool,
+    pub opacity: f64,
+    pub z_order: i32,
+}
+
+#[tauri::command]
+pub fn save_chart_layer_state(layer_state: ChartLayerStateInput, state: State<AppState>) -> CommandResult<()> {
+    let db_state = ChartLayerState {
+        chart_id: layer_state.chart_id,
+        enabled: layer_state.enabled,
+        opacity: layer_state.opacity,
+        z_order: layer_state.z_order,
+    };
+
+    match state.config_db.save_chart_layer_state(&db_state) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_chart_layer_states(state: State<AppState>) -> CommandResult<Vec<ChartLayerState>> {
+    match state.config_db.get_chart_layer_states() {
+        Ok(states) => CommandResult::ok(states),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
 }
 
 // ============ Utility Commands ============

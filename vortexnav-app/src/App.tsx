@@ -18,6 +18,7 @@ import {
   type GpsSourceStatus,
   type Waypoint,
 } from './hooks/useTauri';
+import { useChartLayers } from './hooks/useChartLayers';
 import './App.css';
 
 function App() {
@@ -42,10 +43,14 @@ function App() {
   });
   const [connected, setConnected] = useState(false);
 
-  // GPS settings panel
+  // Panels
   const [showGpsSettings, setShowGpsSettings] = useState(false);
   const [showGpsStatus, setShowGpsStatus] = useState(false);
+  const [showLayerPanel, setShowLayerPanel] = useState(false);
   const [gpsStatus, setGpsStatus] = useState<GpsSourceStatus | null>(null);
+
+  // Map orientation mode: 'north-up' or 'heading-up'
+  const [orientationMode, setOrientationMode] = useState<'north-up' | 'heading-up'>('north-up');
 
   // Waypoints state
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
@@ -59,6 +64,17 @@ function App() {
 
   // Cursor position state
   const [cursorPosition, setCursorPosition] = useState<{ lat: number; lon: number } | null>(null);
+
+  // Chart layers
+  const {
+    layers: chartLayers,
+    isLoading: chartLayersLoading,
+    addChartFromFile,
+    removeLayer: removeChartLayer,
+    toggleLayer: toggleChartLayer,
+    setLayerOpacity: setChartLayerOpacity,
+    zoomToLayer: getChartLayerBounds,
+  } = useChartLayers();
 
   // Load settings from backend on startup
   useEffect(() => {
@@ -361,6 +377,17 @@ function App() {
     }
   }, [loadWaypoints, selectedWaypointId, activeWaypointId]);
 
+  // Handle zoom to chart layer bounds
+  const handleZoomToChart = useCallback((chartId: string) => {
+    const bounds = getChartLayerBounds(chartId);
+    if (bounds && mapRef.current) {
+      mapRef.current.fitBounds(
+        [[bounds[0], bounds[1]], [bounds[2], bounds[3]]],
+        { padding: 50, duration: 1000 }
+      );
+    }
+  }, [getChartLayerBounds]);
+
   // Handle quick waypoint creation with auto-generated name
   const waypointCounter = useRef(1);
   const handleQuickWaypointCreate = useCallback(async (lat: number, lon: number) => {
@@ -413,6 +440,9 @@ function App() {
           waypoints={waypoints}
           activeWaypointId={activeWaypointId}
           pendingWaypoint={pendingWaypoint}
+          orientationMode={orientationMode}
+          chartLayers={chartLayers}
+          onOrientationModeChange={setOrientationMode}
           onMapReady={handleMapReady}
           onMapRightClick={handleMapRightClick}
           onWaypointClick={handleWaypointMapClick}
@@ -424,23 +454,25 @@ function App() {
           onCursorLeave={handleCursorLeave}
         />
 
-        <LayerSwitcher
-          theme={theme}
-          currentBasemap={basemap}
-          showOpenSeaMap={showOpenSeaMap}
-          apiKeys={apiKeys}
-          onBasemapChange={handleBasemapChange}
-          onOpenSeaMapToggle={setShowOpenSeaMap}
-          onApiKeysChange={handleApiKeysChange}
-        />
+        {/* Layers Button - top left, second in stack */}
+        <button
+          className="layers-btn"
+          onClick={() => setShowLayerPanel(!showLayerPanel)}
+          title="Layers"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <polygon points="12 2 2 7 12 12 22 7 12 2" />
+            <polyline points="2 17 12 22 22 17" />
+            <polyline points="2 12 12 17 22 12" />
+          </svg>
+        </button>
 
-        {/* My Location Button - standard crosshairs/GPS icon */}
+        {/* My Location Button - top left, first in stack */}
         <button
           className="my-location-btn"
           onClick={handleCenterOnLocation}
           disabled={!vessel.position}
           title={vessel.position ? 'Center on my location' : 'No GPS position available'}
-          style={{ top: '120px' }} // Below navigation controls with spacing
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <circle cx="12" cy="12" r="3" />
@@ -452,10 +484,10 @@ function App() {
           </svg>
         </button>
 
-        {/* Waypoints Button - top left, icon only */}
+        {/* Waypoints Button - top left, third in stack */}
         <button
           className="waypoints-btn"
-          onClick={() => setShowWaypointPanel(true)}
+          onClick={() => setShowWaypointPanel(!showWaypointPanel)}
           title="Waypoints"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -464,10 +496,10 @@ function App() {
           </svg>
         </button>
 
-        {/* Settings Button - top left, below waypoints */}
+        {/* Settings Button - top left, first in stack */}
         <button
           className="settings-btn"
-          onClick={() => setShowGpsSettings(true)}
+          onClick={() => setShowGpsSettings(!showGpsSettings)}
           title="Settings"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -517,6 +549,26 @@ function App() {
           onWaypointsChange={loadWaypoints}
           pendingWaypoint={pendingWaypoint}
           onPendingWaypointClear={() => setPendingWaypoint(null)}
+        />
+      )}
+
+      {showLayerPanel && (
+        <LayerSwitcher
+          theme={theme}
+          currentBasemap={basemap}
+          showOpenSeaMap={showOpenSeaMap}
+          apiKeys={apiKeys}
+          chartLayers={chartLayers}
+          chartLayersLoading={chartLayersLoading}
+          onBasemapChange={handleBasemapChange}
+          onOpenSeaMapToggle={setShowOpenSeaMap}
+          onApiKeysChange={handleApiKeysChange}
+          onAddChart={addChartFromFile}
+          onRemoveChart={removeChartLayer}
+          onToggleChart={toggleChartLayer}
+          onChartOpacity={setChartLayerOpacity}
+          onZoomToChart={handleZoomToChart}
+          onClose={() => setShowLayerPanel(false)}
         />
       )}
     </div>

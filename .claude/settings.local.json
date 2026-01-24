@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pushd:*)",
+      "Bash(cargo check:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(git push:*)",
+      "Bash(git add:*)",
+      "Bash(npx tauri icon:*)",
+      "Bash(magick:*)",
+      "Bash(npm install:*)",
+      "Bash(cd:*)"
+    ]
+  }
+}

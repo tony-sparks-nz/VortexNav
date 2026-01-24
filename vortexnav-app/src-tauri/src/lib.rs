@@ -20,6 +20,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Get app data directory for database storage
             let app_data_dir = app.path().app_data_dir()
@@ -77,6 +78,10 @@ pub fn run() {
             commands::list_charts,
             commands::get_tile,
             commands::get_charts_directory,
+            commands::import_chart,
+            commands::remove_chart,
+            commands::save_chart_layer_state,
+            commands::get_chart_layer_states,
             // Utilities
             commands::get_app_data_dir,
         ])
