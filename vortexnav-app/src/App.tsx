@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
-import { MapView, StatusBar, LayerSwitcher } from './components';
+import { MapView, StatusBar, LayerSwitcher, GpsSettings } from './components';
 import type { ThemeMode, Vessel, BasemapProvider, ApiKeys } from './types';
 import {
   getSettings,
@@ -8,7 +8,10 @@ import {
   toBackendSettings,
   fromBackendSettings,
   getGpsData,
+  getGpsStatus,
+  startGps,
   isTauri,
+  type GpsSourceStatus,
 } from './hooks/useTauri';
 import './App.css';
 
@@ -32,6 +35,10 @@ function App() {
   });
   const [connected, setConnected] = useState(false);
 
+  // GPS settings panel
+  const [showGpsSettings, setShowGpsSettings] = useState(false);
+  const [gpsStatus, setGpsStatus] = useState<GpsSourceStatus | null>(null);
+
   // Load settings from backend on startup
   useEffect(() => {
     async function loadSettings() {
@@ -51,6 +58,15 @@ function App() {
         setApiKeys(settings.apiKeys);
 
         console.log('Settings loaded from backend');
+
+        // Auto-start GPS if sources are configured
+        try {
+          await startGps();
+          console.log('GPS auto-started');
+        } catch {
+          // No sources configured, that's OK
+          console.log('No GPS sources configured');
+        }
       } catch (error) {
         console.warn('Failed to load settings, using defaults:', error);
       } finally {
@@ -92,7 +108,7 @@ function App() {
     return () => clearTimeout(timeoutId);
   }, [theme, basemap, showOpenSeaMap, apiKeys, settingsLoaded]);
 
-  // Poll GPS data from backend
+  // Poll GPS data and status from backend
   useEffect(() => {
     if (!isTauri()) {
       // Running in browser, simulate GPS for demo
@@ -101,7 +117,12 @@ function App() {
 
     const pollGps = async () => {
       try {
-        const gpsData = await getGpsData();
+        const [gpsData, status] = await Promise.all([
+          getGpsData(),
+          getGpsStatus(),
+        ]);
+
+        setGpsStatus(status);
 
         if (gpsData.latitude != null && gpsData.longitude != null) {
           setVessel({
@@ -110,11 +131,14 @@ function App() {
             cog: gpsData.course,
             sog: gpsData.speed_knots,
           });
-          setConnected(true);
+          setConnected(status.status === 'receiving_data' || status.status === 'connected');
+        } else {
+          setConnected(false);
         }
       } catch (error) {
         // GPS not available or error
         console.debug('GPS poll:', error);
+        setConnected(false);
       }
     };
 
@@ -152,6 +176,14 @@ function App() {
         });
         setConnected(true);
       }, 2000);
+    }
+  }, []);
+
+  const handleGpsSettingsClose = useCallback(() => {
+    setShowGpsSettings(false);
+    // Restart GPS after settings change
+    if (isTauri()) {
+      startGps().catch(() => {});
     }
   }, []);
 
@@ -199,9 +231,15 @@ function App() {
           vessel={vessel}
           theme={theme}
           connected={connected}
+          gpsStatus={gpsStatus}
           onThemeChange={handleThemeChange}
+          onGpsSettingsClick={() => setShowGpsSettings(true)}
         />
       </footer>
+
+      {showGpsSettings && (
+        <GpsSettings theme={theme} onClose={handleGpsSettingsClose} />
+      )}
     </div>
   );
 }

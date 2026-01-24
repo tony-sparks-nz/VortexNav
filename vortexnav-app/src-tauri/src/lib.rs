@@ -3,17 +3,21 @@
 
 mod commands;
 mod database;
+mod gps;
 mod nmea;
 
 use commands::AppState;
 use database::ConfigDatabase;
-use nmea::GpsState;
+use gps::GpsManager;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize logging
+    env_logger::init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -29,13 +33,13 @@ pub fn run() {
             let config_db = ConfigDatabase::new(&app_data_dir)
                 .expect("Failed to initialize configuration database");
 
-            // Initialize GPS state
-            let gps = GpsState::new();
+            // Initialize GPS manager
+            let gps_manager = GpsManager::new();
 
             // Create app state
             let state = AppState {
                 config_db,
-                gps,
+                gps_manager,
                 mbtiles_readers: Mutex::new(HashMap::new()),
                 charts_dir,
             };
@@ -53,7 +57,15 @@ pub fn run() {
             commands::save_settings,
             // GPS
             commands::get_gps_data,
-            commands::update_gps_data,
+            commands::get_gps_status,
+            commands::list_serial_ports,
+            commands::test_gps_port,
+            commands::get_gps_sources,
+            commands::save_gps_source,
+            commands::delete_gps_source,
+            commands::update_gps_priorities,
+            commands::start_gps,
+            commands::stop_gps,
             // Waypoints
             commands::get_waypoints,
             commands::create_waypoint,
@@ -62,8 +74,6 @@ pub fn run() {
             commands::list_charts,
             commands::get_tile,
             commands::get_charts_directory,
-            // Serial ports
-            commands::list_serial_ports,
             // Utilities
             commands::get_app_data_dir,
         ])

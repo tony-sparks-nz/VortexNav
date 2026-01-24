@@ -1,10 +1,13 @@
 import type { Vessel, ThemeMode } from '../types';
+import type { GpsSourceStatus } from '../hooks/useTauri';
 
 interface StatusBarProps {
   vessel: Vessel;
   theme: ThemeMode;
   connected: boolean;
+  gpsStatus?: GpsSourceStatus | null;
   onThemeChange: (theme: ThemeMode) => void;
+  onGpsSettingsClick?: () => void;
 }
 
 function formatCoordinate(value: number | null, type: 'lat' | 'lon'): string {
@@ -31,7 +34,32 @@ function formatHeading(degrees: number | null): string {
   return `${Math.round(degrees).toString().padStart(3, '0')}°`;
 }
 
-export function StatusBar({ vessel, theme, connected, onThemeChange }: StatusBarProps) {
+function getStatusLabel(status: GpsSourceStatus | null | undefined, connected: boolean): string {
+  if (!status) {
+    return connected ? 'Connected' : 'No GPS';
+  }
+  switch (status.status) {
+    case 'receiving_data':
+      return status.source_name || 'GPS Active';
+    case 'connected':
+      return 'Connected';
+    case 'connecting':
+      return 'Connecting...';
+    case 'error':
+      return 'GPS Error';
+    default:
+      return 'No GPS';
+  }
+}
+
+export function StatusBar({
+  vessel,
+  theme,
+  connected,
+  gpsStatus,
+  onThemeChange,
+  onGpsSettingsClick,
+}: StatusBarProps) {
   const themeOptions: ThemeMode[] = ['day', 'dusk', 'night'];
 
   return (
@@ -61,10 +89,14 @@ export function StatusBar({ vessel, theme, connected, onThemeChange }: StatusBar
       </div>
 
       <div className="status-bar__section status-bar__controls">
-        <div className="status-bar__connection">
+        <button
+          className="status-bar__gps-btn"
+          onClick={onGpsSettingsClick}
+          title="GPS Settings"
+        >
           <span className={`connection-indicator ${connected ? 'connected' : 'disconnected'}`} />
-          <span className="status-bar__label">{connected ? 'Connected' : 'No GPS'}</span>
-        </div>
+          <span className="status-bar__label">{getStatusLabel(gpsStatus, connected)}</span>
+        </button>
 
         <div className="theme-switcher">
           {themeOptions.map((t) => (

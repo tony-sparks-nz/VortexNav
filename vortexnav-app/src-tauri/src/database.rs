@@ -66,6 +66,18 @@ impl Default for AppSettings {
     }
 }
 
+// GPS source record for database storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpsSourceRecord {
+    pub id: String,
+    pub name: String,
+    pub source_type: String,
+    pub port_name: Option<String>,
+    pub baud_rate: u32,
+    pub enabled: bool,
+    pub priority: i32,
+}
+
 // MBTiles metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MBTilesMetadata {
@@ -154,6 +166,21 @@ impl ConfigDatabase {
                 maxzoom INTEGER,
                 bounds TEXT,
                 enabled INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+
+        // GPS sources configuration
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS gps_sources (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                port_name TEXT,
+                baud_rate INTEGER NOT NULL DEFAULT 4800,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )",
             [],
@@ -281,6 +308,60 @@ impl ConfigDatabase {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i32>(3)? == 1))
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(files)
+    }
+
+    // GPS source methods
+    pub fn save_gps_source(&self, source: &GpsSourceRecord) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO gps_sources (id, name, source_type, port_name, baud_rate, enabled, priority)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![
+                source.id,
+                source.name,
+                source.source_type,
+                source.port_name,
+                source.baud_rate,
+                if source.enabled { 1 } else { 0 },
+                source.priority
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_gps_sources(&self) -> SqliteResult<Vec<GpsSourceRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source_type, port_name, baud_rate, enabled, priority
+             FROM gps_sources ORDER BY priority ASC, name ASC"
+        )?;
+        let sources = stmt.query_map([], |row| {
+            Ok(GpsSourceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source_type: row.get(2)?,
+                port_name: row.get(3)?,
+                baud_rate: row.get(4)?,
+                enabled: row.get::<_, i32>(5)? == 1,
+                priority: row.get(6)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(sources)
+    }
+
+    pub fn delete_gps_source(&self, id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM gps_sources WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    pub fn update_gps_source_priority(&self, id: &str, priority: i32) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE gps_sources SET priority = ? WHERE id = ?",
+            params![priority, id],
+        )?;
+        Ok(())
     }
 }
 

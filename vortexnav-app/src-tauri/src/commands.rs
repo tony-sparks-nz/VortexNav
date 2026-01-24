@@ -1,7 +1,8 @@
 // Tauri commands for frontend communication
 
-use crate::database::{AppSettings, ConfigDatabase, MBTilesMetadata, MBTilesReader, Waypoint};
-use crate::nmea::{GpsData, GpsState};
+use crate::database::{AppSettings, ConfigDatabase, GpsSourceRecord, MBTilesMetadata, MBTilesReader, Waypoint};
+use crate::gps::{DetectedPort, GpsManager, GpsSourceConfig, GpsSourceStatus, GpsSourceType};
+use crate::nmea::GpsData;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,7 +12,7 @@ use tauri::{Manager, State};
 // App state managed by Tauri
 pub struct AppState {
     pub config_db: ConfigDatabase,
-    pub gps: GpsState,
+    pub gps_manager: GpsManager,
     pub mbtiles_readers: Mutex<HashMap<String, MBTilesReader>>,
     pub charts_dir: PathBuf,
 }
@@ -55,13 +56,135 @@ pub fn save_settings(settings: AppSettings, state: State<AppState>) -> CommandRe
 
 #[tauri::command]
 pub fn get_gps_data(state: State<AppState>) -> CommandResult<GpsData> {
-    CommandResult::ok(state.gps.get_current())
+    CommandResult::ok(state.gps_manager.get_data())
 }
 
 #[tauri::command]
-pub fn update_gps_data(nmea_data: String, state: State<AppState>) -> CommandResult<GpsData> {
-    let data = state.gps.update(&nmea_data);
-    CommandResult::ok(data)
+pub fn get_gps_status(state: State<AppState>) -> CommandResult<GpsSourceStatus> {
+    CommandResult::ok(state.gps_manager.get_status())
+}
+
+#[tauri::command]
+pub fn list_serial_ports() -> CommandResult<Vec<DetectedPort>> {
+    match GpsManager::list_serial_ports() {
+        Ok(ports) => CommandResult::ok(ports),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn test_gps_port(port_name: String, baud_rate: u32) -> CommandResult<bool> {
+    match GpsManager::test_port(&port_name, baud_rate, 3000) {
+        Ok(is_gps) => CommandResult::ok(is_gps),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_gps_sources(state: State<AppState>) -> CommandResult<Vec<GpsSourceConfig>> {
+    // Load from database and convert to config
+    match state.config_db.get_gps_sources() {
+        Ok(records) => {
+            let configs: Vec<GpsSourceConfig> = records
+                .into_iter()
+                .map(|r| GpsSourceConfig {
+                    id: r.id,
+                    name: r.name,
+                    source_type: match r.source_type.as_str() {
+                        "serial_port" => GpsSourceType::SerialPort,
+                        "tcp_stream" => GpsSourceType::TcpStream,
+                        "simulated" => GpsSourceType::Simulated,
+                        _ => GpsSourceType::SerialPort,
+                    },
+                    port_name: r.port_name,
+                    baud_rate: r.baud_rate,
+                    enabled: r.enabled,
+                    priority: r.priority,
+                })
+                .collect();
+            CommandResult::ok(configs)
+        }
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn save_gps_source(source: GpsSourceConfig, state: State<AppState>) -> CommandResult<()> {
+    let record = GpsSourceRecord {
+        id: source.id,
+        name: source.name,
+        source_type: match source.source_type {
+            GpsSourceType::SerialPort => "serial_port".to_string(),
+            GpsSourceType::TcpStream => "tcp_stream".to_string(),
+            GpsSourceType::Simulated => "simulated".to_string(),
+        },
+        port_name: source.port_name,
+        baud_rate: source.baud_rate,
+        enabled: source.enabled,
+        priority: source.priority,
+    };
+
+    match state.config_db.save_gps_source(&record) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn delete_gps_source(id: String, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.delete_gps_source(&id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn update_gps_priorities(priorities: Vec<(String, i32)>, state: State<AppState>) -> CommandResult<()> {
+    for (id, priority) in priorities {
+        if let Err(e) = state.config_db.update_gps_source_priority(&id, priority) {
+            return CommandResult::err(&e.to_string());
+        }
+    }
+    CommandResult::ok(())
+}
+
+#[tauri::command]
+pub fn start_gps(state: State<AppState>) -> CommandResult<()> {
+    // Load sources from database
+    let sources = match state.config_db.get_gps_sources() {
+        Ok(records) => records
+            .into_iter()
+            .map(|r| GpsSourceConfig {
+                id: r.id,
+                name: r.name,
+                source_type: match r.source_type.as_str() {
+                    "serial_port" => GpsSourceType::SerialPort,
+                    "tcp_stream" => GpsSourceType::TcpStream,
+                    "simulated" => GpsSourceType::Simulated,
+                    _ => GpsSourceType::SerialPort,
+                },
+                port_name: r.port_name,
+                baud_rate: r.baud_rate,
+                enabled: r.enabled,
+                priority: r.priority,
+            })
+            .collect(),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    // Set sources and start
+    state.gps_manager.set_sources(sources);
+
+    match state.gps_manager.start() {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn stop_gps(state: State<AppState>) -> CommandResult<()> {
+    state.gps_manager.stop();
+    CommandResult::ok(())
 }
 
 // ============ Waypoint Commands ============
@@ -179,21 +302,6 @@ pub fn get_tile(
 #[tauri::command]
 pub fn get_charts_directory(state: State<AppState>) -> CommandResult<String> {
     CommandResult::ok(state.charts_dir.to_string_lossy().to_string())
-}
-
-// ============ Serial Port Commands (for NMEA) ============
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SerialPortInfo {
-    pub name: String,
-    pub port_type: String,
-}
-
-#[tauri::command]
-pub fn list_serial_ports() -> CommandResult<Vec<SerialPortInfo>> {
-    // Note: This requires the `serialport` crate for full implementation
-    // For now, return a placeholder that will be expanded later
-    CommandResult::ok(vec![])
 }
 
 // ============ Utility Commands ============

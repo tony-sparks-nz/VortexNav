@@ -36,6 +36,48 @@ export interface GpsData {
   timestamp: string | null;
 }
 
+// GPS source types
+export type GpsSourceType = 'serial_port' | 'tcp_stream' | 'simulated';
+
+// GPS connection status
+export type GpsConnectionStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'receiving_data'
+  | 'error';
+
+// Detected serial port
+export interface DetectedPort {
+  port_name: string;
+  port_type: string;
+  manufacturer: string | null;
+  product: string | null;
+  serial_number: string | null;
+  is_likely_gps: boolean;
+}
+
+// GPS source configuration
+export interface GpsSourceConfig {
+  id: string;
+  name: string;
+  source_type: GpsSourceType;
+  port_name: string | null;
+  baud_rate: number;
+  enabled: boolean;
+  priority: number;
+}
+
+// GPS source status
+export interface GpsSourceStatus {
+  source_id: string | null;
+  source_name: string | null;
+  status: GpsConnectionStatus;
+  last_error: string | null;
+  sentences_received: number;
+  last_fix_time: string | null;
+}
+
 // Waypoint definition
 export interface Waypoint {
   id: number | null;
@@ -138,12 +180,74 @@ export async function getGpsData(): Promise<GpsData> {
   return result.data;
 }
 
-export async function updateGpsData(nmeaData: string): Promise<GpsData> {
-  const result = await invoke<CommandResult<GpsData>>('update_gps_data', { nmeaData });
+export async function getGpsStatus(): Promise<GpsSourceStatus> {
+  const result = await invoke<CommandResult<GpsSourceStatus>>('get_gps_status');
   if (!result.success || !result.data) {
-    throw new Error(result.error || 'Failed to update GPS data');
+    throw new Error(result.error || 'Failed to get GPS status');
   }
   return result.data;
+}
+
+export async function listSerialPorts(): Promise<DetectedPort[]> {
+  const result = await invoke<CommandResult<DetectedPort[]>>('list_serial_ports');
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to list serial ports');
+  }
+  return result.data;
+}
+
+export async function testGpsPort(portName: string, baudRate: number): Promise<boolean> {
+  const result = await invoke<CommandResult<boolean>>('test_gps_port', {
+    portName,
+    baudRate,
+  });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to test GPS port');
+  }
+  return result.data ?? false;
+}
+
+export async function getGpsSources(): Promise<GpsSourceConfig[]> {
+  const result = await invoke<CommandResult<GpsSourceConfig[]>>('get_gps_sources');
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to get GPS sources');
+  }
+  return result.data;
+}
+
+export async function saveGpsSource(source: GpsSourceConfig): Promise<void> {
+  const result = await invoke<CommandResult<null>>('save_gps_source', { source });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to save GPS source');
+  }
+}
+
+export async function deleteGpsSource(id: string): Promise<void> {
+  const result = await invoke<CommandResult<null>>('delete_gps_source', { id });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to delete GPS source');
+  }
+}
+
+export async function updateGpsPriorities(priorities: [string, number][]): Promise<void> {
+  const result = await invoke<CommandResult<null>>('update_gps_priorities', { priorities });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to update GPS priorities');
+  }
+}
+
+export async function startGps(): Promise<void> {
+  const result = await invoke<CommandResult<null>>('start_gps');
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to start GPS');
+  }
+}
+
+export async function stopGps(): Promise<void> {
+  const result = await invoke<CommandResult<null>>('stop_gps');
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to stop GPS');
+  }
 }
 
 // ============ Waypoint Commands ============
@@ -210,4 +314,14 @@ export async function getAppDataDir(): Promise<string> {
 
 export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI__' in window;
+}
+
+// ============ Utility: Generate UUID ============
+
+export function generateId(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
