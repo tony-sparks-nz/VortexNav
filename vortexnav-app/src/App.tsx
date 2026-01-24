@@ -1,7 +1,15 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import { MapView, StatusBar, LayerSwitcher } from './components';
 import type { ThemeMode, Vessel, BasemapProvider, ApiKeys } from './types';
+import {
+  getSettings,
+  saveSettings,
+  toBackendSettings,
+  fromBackendSettings,
+  getGpsData,
+  isTauri,
+} from './hooks/useTauri';
 import './App.css';
 
 function App() {
@@ -10,6 +18,10 @@ function App() {
   const [basemap, setBasemap] = useState<BasemapProvider>('osm');
   const [showOpenSeaMap, setShowOpenSeaMap] = useState(true);
   const [apiKeys, setApiKeys] = useState<ApiKeys>({});
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  // Map state for persistence
+  const mapRef = useRef<maplibregl.Map | null>(null);
 
   // Vessel state
   const [vessel, setVessel] = useState<Vessel>({
@@ -19,6 +31,99 @@ function App() {
     sog: null,
   });
   const [connected, setConnected] = useState(false);
+
+  // Load settings from backend on startup
+  useEffect(() => {
+    async function loadSettings() {
+      if (!isTauri()) {
+        // Running in browser, use defaults
+        setSettingsLoaded(true);
+        return;
+      }
+
+      try {
+        const backendSettings = await getSettings();
+        const settings = fromBackendSettings(backendSettings);
+
+        setTheme(settings.theme);
+        setBasemap(settings.basemap);
+        setShowOpenSeaMap(settings.showOpenSeaMap);
+        setApiKeys(settings.apiKeys);
+
+        console.log('Settings loaded from backend');
+      } catch (error) {
+        console.warn('Failed to load settings, using defaults:', error);
+      } finally {
+        setSettingsLoaded(true);
+      }
+    }
+
+    loadSettings();
+  }, []);
+
+  // Save settings whenever they change
+  useEffect(() => {
+    if (!settingsLoaded || !isTauri()) return;
+
+    // Debounce settings save
+    const timeoutId = setTimeout(async () => {
+      try {
+        const map = mapRef.current;
+        const center = map?.getCenter();
+        const zoom = map?.getZoom();
+
+        const backendSettings = toBackendSettings(
+          theme,
+          basemap,
+          showOpenSeaMap,
+          apiKeys,
+          center?.lat,
+          center?.lng,
+          zoom
+        );
+
+        await saveSettings(backendSettings);
+        console.log('Settings saved to backend');
+      } catch (error) {
+        console.warn('Failed to save settings:', error);
+      }
+    }, 1000);
+
+    return () => clearTimeout(timeoutId);
+  }, [theme, basemap, showOpenSeaMap, apiKeys, settingsLoaded]);
+
+  // Poll GPS data from backend
+  useEffect(() => {
+    if (!isTauri()) {
+      // Running in browser, simulate GPS for demo
+      return;
+    }
+
+    const pollGps = async () => {
+      try {
+        const gpsData = await getGpsData();
+
+        if (gpsData.latitude != null && gpsData.longitude != null) {
+          setVessel({
+            position: { lat: gpsData.latitude, lon: gpsData.longitude },
+            heading: gpsData.heading,
+            cog: gpsData.course,
+            sog: gpsData.speed_knots,
+          });
+          setConnected(true);
+        }
+      } catch (error) {
+        // GPS not available or error
+        console.debug('GPS poll:', error);
+      }
+    };
+
+    // Poll every second
+    const intervalId = setInterval(pollGps, 1000);
+    pollGps(); // Initial poll
+
+    return () => clearInterval(intervalId);
+  }, []);
 
   const handleThemeChange = useCallback((newTheme: ThemeMode) => {
     setTheme(newTheme);
@@ -30,25 +135,36 @@ function App() {
 
   const handleApiKeysChange = useCallback((newKeys: ApiKeys) => {
     setApiKeys(newKeys);
-    // In production, persist to local storage or Tauri store
-    console.log('API keys updated');
   }, []);
 
-  const handleMapReady = useCallback((_map: maplibregl.Map) => {
+  const handleMapReady = useCallback((map: maplibregl.Map) => {
     console.log('Map initialized successfully');
+    mapRef.current = map;
 
-    // Simulate GPS connection for demo purposes
-    // In production, this would connect to NMEA data via Tauri backend
-    setTimeout(() => {
-      setVessel({
-        position: { lat: 37.8044, lon: -122.4194 },
-        heading: 45,
-        cog: 47,
-        sog: 6.2,
-      });
-      setConnected(true);
-    }, 2000);
+    // If running in browser (not Tauri), simulate GPS for demo
+    if (!isTauri()) {
+      setTimeout(() => {
+        setVessel({
+          position: { lat: 37.8044, lon: -122.4194 },
+          heading: 45,
+          cog: 47,
+          sog: 6.2,
+        });
+        setConnected(true);
+      }, 2000);
+    }
   }, []);
+
+  // Don't render until settings are loaded
+  if (!settingsLoaded) {
+    return (
+      <div className="app app--day">
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>
+          Loading...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`app app--${theme}`}>
