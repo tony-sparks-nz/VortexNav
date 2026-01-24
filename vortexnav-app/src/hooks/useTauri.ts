@@ -22,6 +22,15 @@ export interface BackendSettings {
   last_zoom: number | null;
 }
 
+// Individual satellite information
+export interface SatelliteInfo {
+  prn: number;
+  elevation: number | null;
+  azimuth: number | null;
+  snr: number | null;
+  constellation: string;
+}
+
 // GPS data from NMEA parser
 export interface GpsData {
   latitude: number | null;
@@ -33,7 +42,11 @@ export interface GpsData {
   fix_quality: number | null;
   satellites: number | null;
   hdop: number | null;
+  vdop: number | null;
+  pdop: number | null;
   timestamp: string | null;
+  fix_type: string | null;
+  satellites_info: SatelliteInfo[];
 }
 
 // GPS source types
@@ -250,6 +263,21 @@ export async function stopGps(): Promise<void> {
   }
 }
 
+export async function getNmeaBuffer(): Promise<string[]> {
+  const result = await invoke<CommandResult<string[]>>('get_nmea_buffer');
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to get NMEA buffer');
+  }
+  return result.data;
+}
+
+export async function clearNmeaBuffer(): Promise<void> {
+  const result = await invoke<CommandResult<null>>('clear_nmea_buffer');
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to clear NMEA buffer');
+  }
+}
+
 // ============ Waypoint Commands ============
 
 export async function getWaypoints(): Promise<Waypoint[]> {
@@ -268,6 +296,13 @@ export async function createWaypoint(waypoint: Omit<Waypoint, 'id' | 'created_at
     throw new Error(result.error || 'Failed to create waypoint');
   }
   return result.data;
+}
+
+export async function updateWaypoint(waypoint: Waypoint): Promise<void> {
+  const result = await invoke<CommandResult<null>>('update_waypoint', { waypoint });
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to update waypoint');
+  }
 }
 
 export async function deleteWaypoint(id: number): Promise<void> {
@@ -324,4 +359,80 @@ export function generateId(): string {
     const v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
+}
+
+// ============ Navigation Utilities ============
+
+const EARTH_RADIUS_NM = 3440.065; // Earth radius in nautical miles
+
+/**
+ * Calculate the distance between two points using the Haversine formula
+ * @returns Distance in nautical miles
+ */
+export function calculateDistance(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return EARTH_RADIUS_NM * c;
+}
+
+/**
+ * Calculate the initial bearing from point 1 to point 2
+ * @returns Bearing in degrees (0-360)
+ */
+export function calculateBearing(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const toDeg = (rad: number) => (rad * 180) / Math.PI;
+
+  const dLon = toRad(lon2 - lon1);
+  const lat1Rad = toRad(lat1);
+  const lat2Rad = toRad(lat2);
+
+  const y = Math.sin(dLon) * Math.cos(lat2Rad);
+  const x =
+    Math.cos(lat1Rad) * Math.sin(lat2Rad) -
+    Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+
+  const bearing = toDeg(Math.atan2(y, x));
+  return (bearing + 360) % 360;
+}
+
+/**
+ * Format distance for display
+ */
+export function formatDistance(nm: number): string {
+  if (nm < 0.1) {
+    // Show in meters for very short distances
+    const meters = nm * 1852;
+    return `${Math.round(meters)}m`;
+  } else if (nm < 10) {
+    return `${nm.toFixed(2)} nm`;
+  } else {
+    return `${nm.toFixed(1)} nm`;
+  }
+}
+
+/**
+ * Format bearing for display
+ */
+export function formatBearing(degrees: number): string {
+  return `${Math.round(degrees).toString().padStart(3, '0')}°`;
 }

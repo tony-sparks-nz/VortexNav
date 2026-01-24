@@ -187,6 +187,17 @@ pub fn stop_gps(state: State<AppState>) -> CommandResult<()> {
     CommandResult::ok(())
 }
 
+#[tauri::command]
+pub fn get_nmea_buffer(state: State<AppState>) -> CommandResult<Vec<String>> {
+    CommandResult::ok(state.gps_manager.get_nmea_buffer())
+}
+
+#[tauri::command]
+pub fn clear_nmea_buffer(state: State<AppState>) -> CommandResult<()> {
+    state.gps_manager.clear_nmea_buffer();
+    CommandResult::ok(())
+}
+
 // ============ Waypoint Commands ============
 
 #[tauri::command]
@@ -201,6 +212,14 @@ pub fn get_waypoints(state: State<AppState>) -> CommandResult<Vec<Waypoint>> {
 pub fn create_waypoint(waypoint: Waypoint, state: State<AppState>) -> CommandResult<i64> {
     match state.config_db.create_waypoint(&waypoint) {
         Ok(id) => CommandResult::ok(id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn update_waypoint(waypoint: Waypoint, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.update_waypoint(&waypoint) {
+        Ok(_) => CommandResult::ok(()),
         Err(e) => CommandResult::err(&e.to_string()),
     }
 }

@@ -104,6 +104,14 @@ impl Default for GpsSourceStatus {
     }
 }
 
+// Buffer for storing recent NMEA sentences
+const NMEA_BUFFER_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NmeaBuffer {
+    pub sentences: Vec<String>,
+}
+
 // GPS Manager - handles all GPS operations
 pub struct GpsManager {
     // Current GPS data
@@ -118,6 +126,8 @@ pub struct GpsManager {
     stop_flag: Arc<AtomicBool>,
     // Reader thread handle
     reader_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    // Recent NMEA sentences buffer
+    nmea_buffer: RwLock<Vec<String>>,
 }
 
 impl GpsManager {
@@ -129,7 +139,18 @@ impl GpsManager {
             parser: NmeaParser::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
             reader_handle: Mutex::new(None),
+            nmea_buffer: RwLock::new(Vec::with_capacity(NMEA_BUFFER_SIZE)),
         }
+    }
+
+    /// Get recent NMEA sentences
+    pub fn get_nmea_buffer(&self) -> Vec<String> {
+        self.nmea_buffer.read().unwrap().clone()
+    }
+
+    /// Clear the NMEA buffer
+    pub fn clear_nmea_buffer(&self) {
+        self.nmea_buffer.write().unwrap().clear();
     }
 
     /// Enumerate all available serial ports
@@ -259,12 +280,13 @@ impl GpsManager {
             &*(&self.data as *const RwLock<GpsData>)
         };
         let status_lock = unsafe { &*(&self.status as *const RwLock<GpsSourceStatus>) };
+        let nmea_buffer_lock = unsafe { &*(&self.nmea_buffer as *const RwLock<Vec<String>>) };
         let parser = NmeaParser::new();
         let sources_for_thread = enabled_sources.clone();
 
         // Start reader thread
         let handle = thread::spawn(move || {
-            Self::reader_thread(stop_flag, data_lock, status_lock, parser, sources_for_thread);
+            Self::reader_thread(stop_flag, data_lock, status_lock, nmea_buffer_lock, parser, sources_for_thread);
         });
 
         *self.reader_handle.lock().unwrap() = Some(handle);
@@ -301,6 +323,7 @@ impl GpsManager {
         stop_flag: Arc<AtomicBool>,
         data_lock: &RwLock<GpsData>,
         status_lock: &RwLock<GpsSourceStatus>,
+        nmea_buffer_lock: &RwLock<Vec<String>>,
         parser: NmeaParser,
         sources: Vec<GpsSourceConfig>,
     ) {
@@ -331,6 +354,7 @@ impl GpsManager {
                             &stop_flag,
                             data_lock,
                             status_lock,
+                            nmea_buffer_lock,
                             &parser,
                             port_name,
                             source.baud_rate,
@@ -350,7 +374,7 @@ impl GpsManager {
                     }
                 }
                 GpsSourceType::Simulated => {
-                    Self::run_simulated_gps(&stop_flag, data_lock, status_lock, source);
+                    Self::run_simulated_gps(&stop_flag, data_lock, status_lock, nmea_buffer_lock, source);
                     return;
                 }
                 _ => {}
@@ -366,6 +390,7 @@ impl GpsManager {
         stop_flag: &Arc<AtomicBool>,
         data_lock: &RwLock<GpsData>,
         status_lock: &RwLock<GpsSourceStatus>,
+        nmea_buffer_lock: &RwLock<Vec<String>>,
         parser: &NmeaParser,
         port_name: &str,
         baud_rate: u32,
@@ -400,6 +425,15 @@ impl GpsManager {
                     if trimmed.starts_with('$') {
                         sentences_received += 1;
 
+                        // Add to NMEA buffer (ring buffer behavior)
+                        {
+                            let mut buffer = nmea_buffer_lock.write().unwrap();
+                            if buffer.len() >= NMEA_BUFFER_SIZE {
+                                buffer.remove(0);
+                            }
+                            buffer.push(trimmed.to_string());
+                        }
+
                         // Parse the NMEA sentence
                         if let Ok(new_data) = parser.parse_sentence(trimmed) {
                             // Update GPS data
@@ -431,8 +465,20 @@ impl GpsManager {
                             if new_data.hdop.is_some() {
                                 data.hdop = new_data.hdop;
                             }
+                            if new_data.vdop.is_some() {
+                                data.vdop = new_data.vdop;
+                            }
+                            if new_data.pdop.is_some() {
+                                data.pdop = new_data.pdop;
+                            }
                             if new_data.timestamp.is_some() {
                                 data.timestamp = new_data.timestamp.clone();
+                            }
+                            if new_data.fix_type.is_some() {
+                                data.fix_type = new_data.fix_type.clone();
+                            }
+                            if !new_data.satellites_info.is_empty() {
+                                data.satellites_info = new_data.satellites_info.clone();
                             }
                         }
 
@@ -464,8 +510,11 @@ impl GpsManager {
         stop_flag: &Arc<AtomicBool>,
         data_lock: &RwLock<GpsData>,
         status_lock: &RwLock<GpsSourceStatus>,
+        nmea_buffer_lock: &RwLock<Vec<String>>,
         source: &GpsSourceConfig,
     ) {
+        use crate::nmea::SatelliteInfo;
+
         {
             let mut status = status_lock.write().unwrap();
             status.source_id = Some(source.id.clone());
@@ -478,12 +527,43 @@ impl GpsManager {
         let mut heading: f64 = 45.0;
         let mut count: u64 = 0;
 
+        // Simulated satellite info
+        let simulated_satellites = vec![
+            SatelliteInfo { prn: 3, elevation: Some(45.0), azimuth: Some(120.0), snr: Some(42.0), constellation: "GPS".to_string() },
+            SatelliteInfo { prn: 8, elevation: Some(67.0), azimuth: Some(230.0), snr: Some(38.0), constellation: "GPS".to_string() },
+            SatelliteInfo { prn: 14, elevation: Some(23.0), azimuth: Some(45.0), snr: Some(35.0), constellation: "GPS".to_string() },
+            SatelliteInfo { prn: 22, elevation: Some(56.0), azimuth: Some(310.0), snr: Some(40.0), constellation: "GPS".to_string() },
+            SatelliteInfo { prn: 27, elevation: Some(78.0), azimuth: Some(180.0), snr: Some(44.0), constellation: "GPS".to_string() },
+            SatelliteInfo { prn: 65, elevation: Some(34.0), azimuth: Some(90.0), snr: Some(32.0), constellation: "GLONASS".to_string() },
+            SatelliteInfo { prn: 66, elevation: Some(52.0), azimuth: Some(270.0), snr: Some(36.0), constellation: "GLONASS".to_string() },
+            SatelliteInfo { prn: 72, elevation: Some(41.0), azimuth: Some(15.0), snr: Some(30.0), constellation: "GLONASS".to_string() },
+        ];
+
         while !stop_flag.load(Ordering::SeqCst) {
             // Simulate movement
             lat += 0.0001 * heading.to_radians().cos();
             lon += 0.0001 * heading.to_radians().sin();
             heading = (heading + 0.5) % 360.0;
             count += 1;
+
+            // Generate simulated NMEA sentences
+            let gga = format!("$GPGGA,{:06.0},3748.264,N,12225.164,W,1,08,0.9,10.5,M,-34.0,M,,*47",
+                (count * 1000) % 240000);
+            let rmc = format!("$GPRMC,{:06.0},A,3748.264,N,12225.164,W,5.5,{:.1},230125,,,A*00",
+                (count * 1000) % 240000, heading);
+
+            // Add to NMEA buffer
+            {
+                let mut buffer = nmea_buffer_lock.write().unwrap();
+                if buffer.len() >= NMEA_BUFFER_SIZE {
+                    buffer.remove(0);
+                }
+                buffer.push(gga);
+                if buffer.len() >= NMEA_BUFFER_SIZE {
+                    buffer.remove(0);
+                }
+                buffer.push(rmc);
+            }
 
             {
                 let mut data = data_lock.write().unwrap();
@@ -494,11 +574,16 @@ impl GpsManager {
                 data.heading = Some(heading);
                 data.fix_quality = Some(1);
                 data.satellites = Some(8);
+                data.hdop = Some(0.9);
+                data.vdop = Some(1.2);
+                data.pdop = Some(1.5);
+                data.fix_type = Some("GPS".to_string());
+                data.satellites_info = simulated_satellites.clone();
             }
 
             {
                 let mut status = status_lock.write().unwrap();
-                status.sentences_received = count;
+                status.sentences_received = count * 2; // GGA + RMC per cycle
             }
 
             thread::sleep(Duration::from_millis(1000));

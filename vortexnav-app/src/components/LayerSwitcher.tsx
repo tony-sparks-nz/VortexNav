@@ -46,7 +46,7 @@ export function LayerSwitcher({
       <button
         className="layer-switcher__toggle"
         onClick={() => setIsOpen(!isOpen)}
-        title="Layer options"
+        title="Layers"
       >
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <polygon points="12 2 2 7 12 12 22 7 12 2" />

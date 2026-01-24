@@ -282,6 +282,15 @@ impl ConfigDatabase {
         Ok(waypoints)
     }
 
+    pub fn update_waypoint(&self, waypoint: &Waypoint) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE waypoints SET name = ?, lat = ?, lon = ?, description = ?, symbol = ? WHERE id = ?",
+            params![waypoint.name, waypoint.lat, waypoint.lon, waypoint.description, waypoint.symbol, waypoint.id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_waypoint(&self, id: i64) -> SqliteResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM waypoints WHERE id = ?", params![id])?;

@@ -1,6 +1,7 @@
 // NMEA 0183 parser module for GPS data
 
 use nmea::Nmea;
+use nmea::sentences::{FixType, GnssType};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use thiserror::Error;
@@ -15,6 +16,16 @@ pub enum NmeaError {
     NoFix,
 }
 
+// Individual satellite information from GSV sentences
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SatelliteInfo {
+    pub prn: u32,           // Satellite PRN number
+    pub elevation: Option<f32>,  // Elevation in degrees (0-90)
+    pub azimuth: Option<f32>,    // Azimuth in degrees (0-359)
+    pub snr: Option<f32>,        // Signal-to-noise ratio (0-99 dB)
+    pub constellation: String,   // GPS, GLONASS, Galileo, etc.
+}
+
 // GPS position data sent to frontend
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GpsData {
@@ -27,7 +38,11 @@ pub struct GpsData {
     pub fix_quality: Option<u8>,
     pub satellites: Option<u32>,
     pub hdop: Option<f32>,             // Horizontal dilution of precision
+    pub vdop: Option<f32>,             // Vertical dilution of precision
+    pub pdop: Option<f32>,             // Position dilution of precision
     pub timestamp: Option<String>,
+    pub fix_type: Option<String>,      // No fix, 2D, 3D
+    pub satellites_info: Vec<SatelliteInfo>,  // Individual satellite data
 }
 
 // NMEA parser state
@@ -49,6 +64,42 @@ impl NmeaParser {
         // Parse the sentence
         nmea.parse(sentence).map_err(|e| NmeaError::Parse(format!("{:?}", e)))?;
 
+        // Extract satellite information
+        let satellites_info: Vec<SatelliteInfo> = nmea.satellites()
+            .iter()
+            .map(|sat| {
+                let constellation = match sat.gnss_type() {
+                    GnssType::Galileo => "Galileo",
+                    GnssType::Gps => "GPS",
+                    GnssType::Glonass => "GLONASS",
+                    GnssType::Beidou => "BeiDou",
+                    GnssType::Qzss => "QZSS",
+                    GnssType::NavIC => "NavIC",
+                }.to_string();
+
+                SatelliteInfo {
+                    prn: sat.prn(),
+                    elevation: sat.elevation(),
+                    azimuth: sat.azimuth(),
+                    snr: sat.snr(),
+                    constellation,
+                }
+            })
+            .collect();
+
+        // Determine fix type string
+        let fix_type = nmea.fix_type.map(|f| match f {
+            FixType::Invalid => "No Fix".to_string(),
+            FixType::Gps => "GPS".to_string(),
+            FixType::DGps => "DGPS".to_string(),
+            FixType::Pps => "PPS".to_string(),
+            FixType::Rtk => "RTK".to_string(),
+            FixType::FloatRtk => "Float RTK".to_string(),
+            FixType::Estimated => "Estimated".to_string(),
+            FixType::Manual => "Manual".to_string(),
+            FixType::Simulation => "Simulation".to_string(),
+        });
+
         // Extract all available data (convert f32 to f64 where needed)
         let data = GpsData {
             latitude: nmea.latitude,
@@ -60,7 +111,11 @@ impl NmeaParser {
             fix_quality: nmea.fix_type.map(|f| f as u8),
             satellites: nmea.num_of_fix_satellites,
             hdop: nmea.hdop,
+            vdop: nmea.vdop,
+            pdop: nmea.pdop,
             timestamp: nmea.fix_time.map(|t| t.to_string()),
+            fix_type,
+            satellites_info,
         };
 
         Ok(data)
@@ -84,7 +139,11 @@ impl NmeaParser {
                     if gps.fix_quality.is_some() { latest.fix_quality = gps.fix_quality; }
                     if gps.satellites.is_some() { latest.satellites = gps.satellites; }
                     if gps.hdop.is_some() { latest.hdop = gps.hdop; }
+                    if gps.vdop.is_some() { latest.vdop = gps.vdop; }
+                    if gps.pdop.is_some() { latest.pdop = gps.pdop; }
                     if gps.timestamp.is_some() { latest.timestamp = gps.timestamp; }
+                    if gps.fix_type.is_some() { latest.fix_type = gps.fix_type; }
+                    if !gps.satellites_info.is_empty() { latest.satellites_info = gps.satellites_info; }
                 }
             }
         }
@@ -128,7 +187,11 @@ impl GpsState {
         if new_data.fix_quality.is_some() { current.fix_quality = new_data.fix_quality; }
         if new_data.satellites.is_some() { current.satellites = new_data.satellites; }
         if new_data.hdop.is_some() { current.hdop = new_data.hdop; }
+        if new_data.vdop.is_some() { current.vdop = new_data.vdop; }
+        if new_data.pdop.is_some() { current.pdop = new_data.pdop; }
         if new_data.timestamp.is_some() { current.timestamp = new_data.timestamp.clone(); }
+        if new_data.fix_type.is_some() { current.fix_type = new_data.fix_type.clone(); }
+        if !new_data.satellites_info.is_empty() { current.satellites_info = new_data.satellites_info.clone(); }
 
         current.clone()
     }

@@ -66,9 +66,12 @@ pub fn run() {
             commands::update_gps_priorities,
             commands::start_gps,
             commands::stop_gps,
+            commands::get_nmea_buffer,
+            commands::clear_nmea_buffer,
             // Waypoints
             commands::get_waypoints,
             commands::create_waypoint,
+            commands::update_waypoint,
             commands::delete_waypoint,
             // Charts/MBTiles
             commands::list_charts,
