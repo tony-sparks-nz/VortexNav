@@ -9,6 +9,7 @@ interface StatusBarProps {
   gpsStatus?: GpsSourceStatus | null;
   cursorPosition?: { lat: number; lon: number } | null;
   activeWaypoint?: Waypoint | null;
+  currentZoom?: number;
   onThemeChange: (theme: ThemeMode) => void;
   onGpsStatusClick?: () => void;
 }
@@ -102,6 +103,7 @@ export function StatusBar({
   gpsStatus,
   cursorPosition,
   activeWaypoint,
+  currentZoom,
   onThemeChange,
   onGpsStatusClick,
 }: StatusBarProps) {
@@ -186,6 +188,14 @@ export function StatusBar({
           <span className="status-bar__value">{formatHeading(vessel.heading)}</span>
         </div>
       </div>
+
+      {/* Zoom Level */}
+      {currentZoom !== undefined && (
+        <div className="status-bar__section status-bar__zoom">
+          <span className="status-bar__label">Zoom</span>
+          <span className="status-bar__value">{currentZoom.toFixed(1)}</span>
+        </div>
+      )}
 
       {/* Active Waypoint Navigation Display */}
       {activeWaypoint && (

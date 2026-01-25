@@ -19,6 +19,7 @@ interface UseChartLayersReturn {
   refreshLayers: () => Promise<void>;
   addChartFromFile: () => Promise<void>;
   removeLayer: (chartId: string) => Promise<void>;
+  removeMultipleLayers: (chartIds: string[]) => Promise<void>;
   toggleLayer: (chartId: string) => Promise<void>;
   setLayerOpacity: (chartId: string, opacity: number) => Promise<void>;
   zoomToLayer: (chartId: string) => [number, number, number, number] | null;
@@ -35,14 +36,36 @@ function getTileType(format: string | null): 'raster' | 'vector' {
 
 /**
  * Parse bounds string "minlon,minlat,maxlon,maxlat" to array
+ * Also handles antimeridian-crossing charts where bounds may be incorrectly wrapped
  */
 function parseBounds(bounds: string | null): [number, number, number, number] | undefined {
   if (!bounds) return undefined;
   const parts = bounds.split(',').map(Number);
-  if (parts.length === 4 && parts.every(n => !isNaN(n))) {
-    return parts as [number, number, number, number];
+  if (parts.length !== 4 || !parts.every(n => !isNaN(n))) {
+    return undefined;
   }
-  return undefined;
+
+  let [minLon, minLat, maxLon, maxLat] = parts;
+
+  // Detect and fix antimeridian-crossing bounds
+  // If the bounding box appears to span most of the world (> 300 degrees),
+  // it's likely an incorrectly interpreted antimeridian crossing
+  const lonSpan = maxLon - minLon;
+
+  if (lonSpan > 300) {
+    // This chart probably crosses the antimeridian incorrectly
+    // The bounds are likely inverted - we need to fix them for zoom-to-layer
+    console.log(`Detected antimeridian-crossing chart: [${minLon}, ${minLat}, ${maxLon}, ${maxLat}]`);
+
+    // For charts that should span across the dateline, swap the lon values
+    // and adjust for display. The actual small region is between maxLon and minLon
+    // wrapping around 180/-180
+    [minLon, maxLon] = [maxLon, minLon];
+
+    console.log(`Adjusted bounds for zoom: [${minLon}, ${minLat}, ${maxLon}, ${maxLat}]`);
+  }
+
+  return [minLon, minLat, maxLon, maxLat] as [number, number, number, number];
 }
 
 /**
@@ -153,6 +176,25 @@ export function useChartLayers(): UseChartLayersReturn {
     }
   }, [refreshLayers]);
 
+  // Remove multiple layers at once
+  const removeMultipleLayers = useCallback(async (chartIds: string[]) => {
+    if (!isTauri() || chartIds.length === 0) return;
+
+    try {
+      setIsLoading(true);
+      // Remove each chart - could be optimized with batch API if needed
+      for (const chartId of chartIds) {
+        await removeChart(chartId);
+      }
+      await refreshLayers();
+    } catch (err) {
+      console.error('Failed to remove charts:', err);
+      setError(err instanceof Error ? err.message : 'Failed to remove charts');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [refreshLayers]);
+
   // Toggle layer visibility
   const toggleLayer = useCallback(async (chartId: string) => {
     if (!isTauri()) return;
@@ -223,6 +265,7 @@ export function useChartLayers(): UseChartLayersReturn {
     refreshLayers,
     addChartFromFile,
     removeLayer,
+    removeMultipleLayers,
     toggleLayer,
     setLayerOpacity,
     zoomToLayer,

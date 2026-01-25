@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import maplibregl from 'maplibre-gl';
+import maplibregl, { LngLatBounds } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel, ChartLayer } from '../types';
 import type { Waypoint } from '../hooks/useTauri';
 import { registerMBTilesProtocol } from '../utils/mbtilesProtocol';
+
+export type { LngLatBounds };
 
 interface ContextMenuState {
   visible: boolean;
@@ -43,6 +45,7 @@ interface MapViewProps {
   onQuickWaypointCreate?: (lat: number, lon: number) => void;
   onCursorMove?: (lat: number, lon: number) => void;
   onCursorLeave?: () => void;
+  onBoundsChange?: (bounds: LngLatBounds, zoom: number) => void;
 }
 
 // Waypoint symbol icons mapping
@@ -277,6 +280,7 @@ export function MapView({
   onQuickWaypointCreate,
   onCursorMove,
   onCursorLeave,
+  onBoundsChange,
 }: MapViewProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -317,8 +321,10 @@ export function MapView({
   const onWaypointDeleteRef = useRef(onWaypointDelete);
   const onWaypointDragRef = useRef(onWaypointDrag);
   const onOrientationModeChangeRef = useRef(onOrientationModeChange);
+  const onBoundsChangeRef = useRef(onBoundsChange);
   onCursorMoveRef.current = onCursorMove;
   onCursorLeaveRef.current = onCursorLeave;
+  onBoundsChangeRef.current = onBoundsChange;
   onMapRightClickRef.current = onMapRightClick;
   onWaypointDragEndRef.current = onWaypointDragEnd;
   onQuickWaypointCreateRef.current = onQuickWaypointCreate;
@@ -461,6 +467,19 @@ export function MapView({
     };
     map.on('mouseleave', handleMouseLeave);
 
+    // Add bounds change handler (fires on moveend for both pan and zoom)
+    const handleMoveEnd = () => {
+      const bounds = map.getBounds();
+      const zoom = map.getZoom();
+      onBoundsChangeRef.current?.(bounds, zoom);
+    };
+    map.on('moveend', handleMoveEnd);
+
+    // Emit initial bounds after map loads
+    map.once('load', () => {
+      handleMoveEnd();
+    });
+
     mapRef.current = map;
 
     return () => {
@@ -472,6 +491,7 @@ export function MapView({
       map.off('touchmove', handleTouchMove);
       map.off('touchend', handleTouchEnd);
       map.off('touchcancel', handleTouchEnd);
+      map.off('moveend', handleMoveEnd);
       map.remove();
       mapRef.current = null;
     };
@@ -515,6 +535,12 @@ export function MapView({
       return;
     }
 
+    // Verify basemap layer exists - if not, the style may have been corrupted
+    if (!map.getLayer('basemap-layer')) {
+      console.warn('MapView: Basemap layer missing! Style may need to be rebuilt.');
+      return;
+    }
+
     console.debug('MapView: Processing chart layers', {
       count: chartLayers.length,
       styleVersion,
@@ -529,45 +555,63 @@ export function MapView({
       const sourceId = `mbtiles-${layer.chartId}`;
       const layerId = `mbtiles-layer-${layer.chartId}`;
 
+      // Skip charts without bounds - they can block other charts and cause rendering issues
+      if (!layer.bounds) {
+        console.debug(`MapView: Skipping chart ${layer.chartId} - no bounds metadata`);
+        return;
+      }
+
       if (layer.enabled) {
         newLayerIds.add(layer.chartId);
 
-        // Add source if not exists
-        if (!map.getSource(sourceId)) {
-          console.debug(`MapView: Adding source ${sourceId}`, {
-            tiles: `mbtiles://${layer.chartId}/{z}/{x}/{y}`,
-            minZoom: layer.minZoom,
-            maxZoom: layer.maxZoom
-          });
-          map.addSource(sourceId, {
-            type: 'raster',
-            tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
-            tileSize: 256,
-            minzoom: layer.minZoom ?? 0,
-            maxzoom: layer.maxZoom ?? 22,
-          });
-        }
+        try {
+          // Add source if not exists
+          if (!map.getSource(sourceId)) {
+            console.debug(`MapView: Adding source ${sourceId}`, {
+              tiles: `mbtiles://${layer.chartId}/{z}/{x}/{y}`,
+              minZoom: layer.minZoom,
+              maxZoom: layer.maxZoom,
+              bounds: layer.bounds
+            });
+            map.addSource(sourceId, {
+              type: 'raster',
+              tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
+              tileSize: 256,
+              minzoom: layer.minZoom ?? 0,
+              maxzoom: layer.maxZoom ?? 22,
+              // Set bounds to limit tile requests to the chart's coverage area
+              bounds: layer.bounds,
+            });
+          }
 
-        // Add layer if not exists
-        if (!map.getLayer(layerId)) {
-          // Insert before OpenSeaMap overlay if it exists, otherwise add to top
-          const beforeLayerId = map.getLayer('openseamap-overlay') ? 'openseamap-overlay' : undefined;
+          // Add layer if not exists
+          if (!map.getLayer(layerId)) {
+            // Insert before OpenSeaMap overlay if it exists, otherwise before basemap's end
+            // This ensures chart layers are ABOVE the basemap
+            let beforeLayerId: string | undefined;
+            if (map.getLayer('openseamap-overlay')) {
+              beforeLayerId = 'openseamap-overlay';
+            }
+            // If no specific layer to insert before, addLayer adds to top (which is correct)
 
-          console.debug(`MapView: Adding layer ${layerId}`, {
-            beforeLayerId,
-            opacity: layer.opacity
-          });
-          map.addLayer({
-            id: layerId,
-            type: 'raster',
-            source: sourceId,
-            paint: {
-              'raster-opacity': layer.opacity,
-            },
-          }, beforeLayerId);
-        } else {
-          // Update opacity if layer already exists
-          map.setPaintProperty(layerId, 'raster-opacity', layer.opacity);
+            console.debug(`MapView: Adding layer ${layerId}`, {
+              beforeLayerId,
+              opacity: layer.opacity
+            });
+            map.addLayer({
+              id: layerId,
+              type: 'raster',
+              source: sourceId,
+              paint: {
+                'raster-opacity': layer.opacity,
+              },
+            }, beforeLayerId);
+          } else {
+            // Update opacity if layer already exists
+            map.setPaintProperty(layerId, 'raster-opacity', layer.opacity);
+          }
+        } catch (err) {
+          console.error(`MapView: Error adding chart layer ${layerId}:`, err);
         }
       }
     });
@@ -578,17 +622,35 @@ export function MapView({
         const layerId = `mbtiles-layer-${chartId}`;
         const sourceId = `mbtiles-${chartId}`;
 
-        if (map.getLayer(layerId)) {
-          map.removeLayer(layerId);
-        }
-        if (map.getSource(sourceId)) {
-          map.removeSource(sourceId);
+        try {
+          if (map.getLayer(layerId)) {
+            map.removeLayer(layerId);
+          }
+          if (map.getSource(sourceId)) {
+            map.removeSource(sourceId);
+          }
+        } catch (err) {
+          console.error(`MapView: Error removing chart layer ${layerId}:`, err);
         }
       }
     });
 
     // Update ref with current layer IDs
     activeChartLayerIdsRef.current = newLayerIds;
+
+    // Debug: Log final layer order
+    const allLayers = map.getStyle()?.layers?.map(l => l.id) || [];
+    console.debug('MapView: Layer order after update:', allLayers);
+
+    // Safety check: Ensure basemap layer is visible
+    const basemapLayer = map.getLayer('basemap-layer');
+    if (basemapLayer) {
+      const visibility = map.getLayoutProperty('basemap-layer', 'visibility');
+      if (visibility === 'none') {
+        console.warn('MapView: Basemap was hidden! Making it visible again.');
+        map.setLayoutProperty('basemap-layer', 'visibility', 'visible');
+      }
+    }
   }, [chartLayers, mapLoaded, styleVersion]);
 
   // Update center when it changes

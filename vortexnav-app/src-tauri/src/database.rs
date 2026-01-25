@@ -99,6 +99,51 @@ pub struct ChartLayerState {
     pub z_order: i32,
 }
 
+// Chart catalog (imported from XML)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartCatalog {
+    pub id: Option<i64>,
+    pub name: String,
+    pub catalog_type: String,  // "RNC" or "ENC"
+    pub source_type: String,   // "file" or "url"
+    pub source_path: String,   // Local file path or remote URL
+    pub imported_at: Option<String>,
+    pub last_refreshed: Option<String>,
+    pub chart_count: Option<i64>,
+}
+
+// Chart available in a catalog
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogChart {
+    pub id: Option<i64>,
+    pub catalog_id: i64,
+    pub chart_id: String,      // number (RNC) or name (ENC)
+    pub title: String,
+    pub chart_type: String,    // "RNC", "ENC"
+    pub format: Option<String>, // "BSB", "S57", "MBTiles"
+    pub scale: Option<i64>,
+    pub status: Option<String>, // "Active", "Cancelled", etc.
+    pub download_url: String,
+    pub file_size: Option<i64>,
+    pub last_updated: Option<String>,
+    pub bounds: Option<String>, // JSON coverage polygon
+    pub download_status: String, // "available", "downloading", "downloaded", "converting", "ready", "failed"
+    pub download_progress: i64,
+    pub download_path: Option<String>,
+    pub mbtiles_path: Option<String>,
+    pub error_message: Option<String>,
+}
+
+// Download progress info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgress {
+    pub chart_id: String,
+    pub bytes_downloaded: i64,
+    pub total_bytes: i64,
+    pub status: String,
+    pub error: Option<String>,
+}
+
 // Configuration database manager
 pub struct ConfigDatabase {
     conn: Mutex<Connection>,
@@ -202,6 +247,45 @@ impl ConfigDatabase {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 opacity REAL NOT NULL DEFAULT 1.0,
                 z_order INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+
+        // Chart catalogs - imported from XML files or URLs
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chart_catalogs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                catalog_type TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_refreshed TEXT
+            )",
+            [],
+        )?;
+
+        // Catalog charts - charts available in imported catalogs
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS catalog_charts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                catalog_id INTEGER NOT NULL,
+                chart_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                chart_type TEXT NOT NULL,
+                format TEXT,
+                scale INTEGER,
+                status TEXT,
+                download_url TEXT NOT NULL,
+                file_size INTEGER,
+                last_updated TEXT,
+                bounds TEXT,
+                download_status TEXT DEFAULT 'available',
+                download_progress INTEGER DEFAULT 0,
+                download_path TEXT,
+                mbtiles_path TEXT,
+                error_message TEXT,
+                FOREIGN KEY (catalog_id) REFERENCES chart_catalogs(id) ON DELETE CASCADE
             )",
             [],
         )?;
@@ -458,6 +542,231 @@ impl ConfigDatabase {
             "DELETE FROM mbtiles_registry WHERE file_path LIKE ?",
             params![format!("%{}.mbtiles", chart_id)],
         )?;
+        Ok(())
+    }
+
+    // Chart catalog methods
+    pub fn create_catalog(&self, catalog: &ChartCatalog) -> SqliteResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chart_catalogs (name, catalog_type, source_type, source_path)
+             VALUES (?, ?, ?, ?)",
+            params![catalog.name, catalog.catalog_type, catalog.source_type, catalog.source_path],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_catalogs(&self) -> SqliteResult<Vec<ChartCatalog>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.name, c.catalog_type, c.source_type, c.source_path,
+                    c.imported_at, c.last_refreshed,
+                    (SELECT COUNT(*) FROM catalog_charts WHERE catalog_id = c.id) as chart_count
+             FROM chart_catalogs c ORDER BY c.name"
+        )?;
+        let catalogs = stmt.query_map([], |row| {
+            Ok(ChartCatalog {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                catalog_type: row.get(2)?,
+                source_type: row.get(3)?,
+                source_path: row.get(4)?,
+                imported_at: row.get(5)?,
+                last_refreshed: row.get(6)?,
+                chart_count: row.get(7)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(catalogs)
+    }
+
+    pub fn get_catalog(&self, id: i64) -> SqliteResult<Option<ChartCatalog>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.name, c.catalog_type, c.source_type, c.source_path,
+                    c.imported_at, c.last_refreshed,
+                    (SELECT COUNT(*) FROM catalog_charts WHERE catalog_id = c.id) as chart_count
+             FROM chart_catalogs c WHERE c.id = ?"
+        )?;
+        let result = stmt.query_row([id], |row| {
+            Ok(ChartCatalog {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                catalog_type: row.get(2)?,
+                source_type: row.get(3)?,
+                source_path: row.get(4)?,
+                imported_at: row.get(5)?,
+                last_refreshed: row.get(6)?,
+                chart_count: row.get(7)?,
+            })
+        });
+        match result {
+            Ok(catalog) => Ok(Some(catalog)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn update_catalog_refreshed(&self, id: i64) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chart_catalogs SET last_refreshed = CURRENT_TIMESTAMP WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_catalog(&self, id: i64) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        // Charts are deleted via CASCADE
+        conn.execute("DELETE FROM chart_catalogs WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    // Catalog chart methods
+    pub fn create_catalog_chart(&self, chart: &CatalogChart) -> SqliteResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO catalog_charts (catalog_id, chart_id, title, chart_type, format, scale,
+                                         status, download_url, file_size, last_updated, bounds)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                chart.catalog_id,
+                chart.chart_id,
+                chart.title,
+                chart.chart_type,
+                chart.format,
+                chart.scale,
+                chart.status,
+                chart.download_url,
+                chart.file_size,
+                chart.last_updated,
+                chart.bounds
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_catalog_charts(&self, catalog_id: i64) -> SqliteResult<Vec<CatalogChart>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, catalog_id, chart_id, title, chart_type, format, scale, status,
+                    download_url, file_size, last_updated, bounds, download_status,
+                    download_progress, download_path, mbtiles_path, error_message
+             FROM catalog_charts WHERE catalog_id = ? ORDER BY title"
+        )?;
+        let charts = stmt.query_map([catalog_id], |row| {
+            Ok(CatalogChart {
+                id: Some(row.get(0)?),
+                catalog_id: row.get(1)?,
+                chart_id: row.get(2)?,
+                title: row.get(3)?,
+                chart_type: row.get(4)?,
+                format: row.get(5)?,
+                scale: row.get(6)?,
+                status: row.get(7)?,
+                download_url: row.get(8)?,
+                file_size: row.get(9)?,
+                last_updated: row.get(10)?,
+                bounds: row.get(11)?,
+                download_status: row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "available".to_string()),
+                download_progress: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                download_path: row.get(14)?,
+                mbtiles_path: row.get(15)?,
+                error_message: row.get(16)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(charts)
+    }
+
+    pub fn get_catalog_chart(&self, id: i64) -> SqliteResult<Option<CatalogChart>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, catalog_id, chart_id, title, chart_type, format, scale, status,
+                    download_url, file_size, last_updated, bounds, download_status,
+                    download_progress, download_path, mbtiles_path, error_message
+             FROM catalog_charts WHERE id = ?"
+        )?;
+        let result = stmt.query_row([id], |row| {
+            Ok(CatalogChart {
+                id: Some(row.get(0)?),
+                catalog_id: row.get(1)?,
+                chart_id: row.get(2)?,
+                title: row.get(3)?,
+                chart_type: row.get(4)?,
+                format: row.get(5)?,
+                scale: row.get(6)?,
+                status: row.get(7)?,
+                download_url: row.get(8)?,
+                file_size: row.get(9)?,
+                last_updated: row.get(10)?,
+                bounds: row.get(11)?,
+                download_status: row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "available".to_string()),
+                download_progress: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                download_path: row.get(14)?,
+                mbtiles_path: row.get(15)?,
+                error_message: row.get(16)?,
+            })
+        });
+        match result {
+            Ok(chart) => Ok(Some(chart)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn update_chart_download_status(
+        &self,
+        id: i64,
+        status: &str,
+        progress: i64,
+        download_path: Option<&str>,
+        mbtiles_path: Option<&str>,
+        error: Option<&str>,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE catalog_charts SET download_status = ?, download_progress = ?,
+             download_path = ?, mbtiles_path = ?, error_message = ? WHERE id = ?",
+            params![status, progress, download_path, mbtiles_path, error, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_charts_by_status(&self, status: &str) -> SqliteResult<Vec<CatalogChart>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, catalog_id, chart_id, title, chart_type, format, scale, status,
+                    download_url, file_size, last_updated, bounds, download_status,
+                    download_progress, download_path, mbtiles_path, error_message
+             FROM catalog_charts WHERE download_status = ? ORDER BY title"
+        )?;
+        let charts = stmt.query_map([status], |row| {
+            Ok(CatalogChart {
+                id: Some(row.get(0)?),
+                catalog_id: row.get(1)?,
+                chart_id: row.get(2)?,
+                title: row.get(3)?,
+                chart_type: row.get(4)?,
+                format: row.get(5)?,
+                scale: row.get(6)?,
+                status: row.get(7)?,
+                download_url: row.get(8)?,
+                file_size: row.get(9)?,
+                last_updated: row.get(10)?,
+                bounds: row.get(11)?,
+                download_status: row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "available".to_string()),
+                download_progress: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                download_path: row.get(14)?,
+                mbtiles_path: row.get(15)?,
+                error_message: row.get(16)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(charts)
+    }
+
+    pub fn clear_catalog_charts(&self, catalog_id: i64) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM catalog_charts WHERE catalog_id = ?", params![catalog_id])?;
         Ok(())
     }
 }

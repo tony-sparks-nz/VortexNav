@@ -5,3 +5,8 @@ export { GpsSettings } from './GpsSettings';
 export { GpsStatusModal } from './GpsStatusModal';
 export { WaypointPanel } from './WaypointPanel';
 export { ChartLayerItem } from './ChartLayerItem';
+export { CatalogManager } from './CatalogManager';
+export { CatalogBrowser } from './CatalogBrowser';
+export { ChartBar } from './ChartBar';
+export { ChartImportDialog } from './ChartImportDialog';
+export { ImportProgressIndicator } from './ImportProgressIndicator';

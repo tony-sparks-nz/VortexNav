@@ -1,45 +1,83 @@
-// Chart Layer Item Component - Individual chart layer control
+// Chart Layer Item Component - Individual chart layer control (compact version)
 import type { ChartLayer, ThemeMode } from '../types';
 
 interface ChartLayerItemProps {
   layer: ChartLayer;
   theme: ThemeMode;
+  isSelected?: boolean;
   onToggle: () => void;
-  onOpacityChange: (opacity: number) => void;
+  onSelect?: () => void;
   onZoomTo: () => void;
   onRemove: () => void;
 }
 
+// Check if a chart has complete metadata for proper display
+function hasCompleteMetadata(layer: ChartLayer): boolean {
+  return layer.bounds !== undefined &&
+         layer.minZoom !== undefined &&
+         layer.maxZoom !== undefined;
+}
+
 export function ChartLayerItem({
   layer,
+  isSelected,
   onToggle,
-  onOpacityChange,
+  onSelect,
   onZoomTo,
   onRemove,
 }: ChartLayerItemProps) {
-  const handleOpacityChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    onOpacityChange(parseFloat(e.target.value));
+  const isComplete = hasCompleteMetadata(layer);
+  const missingBounds = !layer.bounds;
+  const missingZoom = layer.minZoom === undefined || layer.maxZoom === undefined;
+
+  const handleClick = (e: React.MouseEvent) => {
+    // Don't select when clicking on buttons or toggle
+    if ((e.target as HTMLElement).closest('button, label')) return;
+    onSelect?.();
   };
 
   return (
-    <div className={`chart-layer-item ${!layer.enabled ? 'chart-layer-item--disabled' : ''}`}>
+    <div
+      className={`chart-layer-item ${!layer.enabled ? 'chart-layer-item--disabled' : ''} ${!isComplete ? 'chart-layer-item--incomplete' : ''} ${isSelected ? 'chart-layer-item--selected' : ''}`}
+      onClick={handleClick}
+    >
       <div className="chart-layer-item__header">
         <label className="chart-layer-item__toggle">
           <input
             type="checkbox"
             checked={layer.enabled}
             onChange={onToggle}
+            disabled={missingBounds}
           />
           <span className="chart-layer-item__toggle-slider" />
         </label>
 
         <div className="chart-layer-item__info">
-          <span className="chart-layer-item__name" title={layer.name}>
-            {layer.name}
-          </span>
+          <div className="chart-layer-item__name-row">
+            <span className="chart-layer-item__name" title={layer.name}>
+              {layer.chartId}
+            </span>
+            {missingBounds && (
+              <span
+                className="chart-layer-item__warning"
+                title="Missing bounds metadata - chart cannot be displayed. Run 'Fix Bounds' from catalog manager."
+              >
+                ⚠️
+              </span>
+            )}
+            {/* Show opacity percentage inline */}
+            {layer.enabled && !missingBounds && (
+              <span className="chart-layer-item__opacity-badge">
+                {Math.round(layer.opacity * 100)}%
+              </span>
+            )}
+          </div>
           <div className="chart-layer-item__meta">
-            <span>{layer.type === 'vector' ? 'Vector' : 'Raster'}</span>
-            {layer.format && <span>• {layer.format.toUpperCase()}</span>}
+            <span className="chart-layer-item__full-name" title={layer.name}>
+              {layer.name !== layer.chartId ? layer.name : (layer.type === 'vector' ? 'Vector Chart' : 'Raster Chart')}
+            </span>
+            {missingBounds && <span className="chart-layer-item__meta--warning">• No bounds</span>}
+            {missingZoom && !missingBounds && <span className="chart-layer-item__meta--warning">• No zoom range</span>}
           </div>
         </div>
 
@@ -68,24 +106,6 @@ export function ChartLayerItem({
           </button>
         </div>
       </div>
-
-      {layer.enabled && (
-        <div className="chart-layer-item__opacity">
-          <span className="chart-layer-item__opacity-label">Opacity</span>
-          <input
-            type="range"
-            className="chart-layer-item__opacity-slider"
-            min="0"
-            max="1"
-            step="0.05"
-            value={layer.opacity}
-            onChange={handleOpacityChange}
-          />
-          <span className="chart-layer-item__opacity-value">
-            {Math.round(layer.opacity * 100)}%
-          </span>
-        </div>
-      )}
     </div>
   );
 }

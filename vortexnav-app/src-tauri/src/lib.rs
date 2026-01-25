@@ -1,8 +1,11 @@
 // VortexNav - Marine Navigation Application
 // Tauri 2.0 Backend
 
+mod catalog_parser;
+mod chart_converter;
 mod commands;
 mod database;
+mod download_manager;
 mod gps;
 mod nmea;
 
@@ -82,6 +85,22 @@ pub fn run() {
             commands::remove_chart,
             commands::save_chart_layer_state,
             commands::get_chart_layer_states,
+            // Catalogs
+            commands::import_catalog_file,
+            commands::import_catalog_url,
+            commands::list_catalogs,
+            commands::get_catalog,
+            commands::delete_catalog,
+            commands::list_catalog_charts,
+            commands::get_catalog_chart,
+            commands::download_catalog_chart,
+            commands::refresh_catalog,
+            commands::check_gdal,
+            commands::import_charts_from_folder,
+            commands::scan_folder_for_import,
+            commands::import_selected_charts,
+            commands::tag_charts_from_bsb,
+            commands::fix_chart_bounds,
             // Utilities
             commands::get_app_data_dir,
         ])

@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import maplibregl from 'maplibre-gl';
-import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel } from './components';
-import type { ThemeMode, Vessel, BasemapProvider, ApiKeys } from './types';
+import maplibregl, { LngLatBounds } from 'maplibre-gl';
+import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel, ChartBar, ImportProgressIndicator } from './components';
+import type { ThemeMode, Vessel, BasemapProvider, ApiKeys, ImportProgress } from './types';
 import {
   getSettings,
   saveSettings,
@@ -65,15 +65,27 @@ function App() {
   // Cursor position state
   const [cursorPosition, setCursorPosition] = useState<{ lat: number; lon: number } | null>(null);
 
+  // Viewport bounds and zoom for chart bar
+  const [viewportBounds, setViewportBounds] = useState<LngLatBounds | null>(null);
+  const [currentZoom, setCurrentZoom] = useState(12);
+
+  // Background import progress state
+  const [backgroundImportProgress, setBackgroundImportProgress] = useState<ImportProgress | null>(null);
+
+  // Fullscreen state
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
   // Chart layers
   const {
     layers: chartLayers,
     isLoading: chartLayersLoading,
     addChartFromFile,
     removeLayer: removeChartLayer,
+    removeMultipleLayers: removeMultipleChartLayers,
     toggleLayer: toggleChartLayer,
     setLayerOpacity: setChartLayerOpacity,
     zoomToLayer: getChartLayerBounds,
+    refreshLayers: refreshChartLayers,
   } = useChartLayers();
 
   // Load settings from backend on startup
@@ -113,6 +125,34 @@ function App() {
 
     loadSettings();
   }, []);
+
+  // Listen for background import progress events from Tauri
+  useEffect(() => {
+    if (!isTauri()) return;
+
+    let unlisten: (() => void) | undefined;
+
+    async function setupListener() {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlisten = await listen<ImportProgress>('import-progress', (event) => {
+          setBackgroundImportProgress(event.payload);
+          // Auto-refresh chart layers when import completes
+          if (event.payload.phase === 'complete' && event.payload.converted > 0) {
+            refreshChartLayers();
+          }
+        });
+      } catch (error) {
+        console.warn('Failed to setup import progress listener:', error);
+      }
+    }
+
+    setupListener();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [refreshChartLayers]);
 
   // Save settings whenever they change
   useEffect(() => {
@@ -277,6 +317,12 @@ function App() {
     setCursorPosition(null);
   }, []);
 
+  // Handle viewport bounds change from map
+  const handleBoundsChange = useCallback((bounds: LngLatBounds, zoom: number) => {
+    setViewportBounds(bounds);
+    setCurrentZoom(zoom);
+  }, []);
+
   // Handle waypoint selection (for navigation)
   const handleNavigateToWaypoint = useCallback((waypoint: Waypoint) => {
     if (activeWaypointId === waypoint.id) {
@@ -411,6 +457,31 @@ function App() {
     }
   }, [loadWaypoints]);
 
+  // Toggle fullscreen mode
+  const toggleFullscreen = useCallback(async () => {
+    if (!isTauri()) {
+      // Browser fallback using Fullscreen API
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        setIsFullscreen(true);
+      } else {
+        await document.exitFullscreen();
+        setIsFullscreen(false);
+      }
+      return;
+    }
+
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const appWindow = getCurrentWindow();
+      const fullscreen = await appWindow.isFullscreen();
+      await appWindow.setFullscreen(!fullscreen);
+      setIsFullscreen(!fullscreen);
+    } catch (error) {
+      console.error('Failed to toggle fullscreen:', error);
+    }
+  }, []);
+
   // Don't render until settings are loaded
   if (!settingsLoaded) {
     return (
@@ -426,7 +497,24 @@ function App() {
     <div className={`app app--${theme}`}>
       <header className="app__header">
         <h1 className="app__title">VortexNav</h1>
-        <span className="app__version">v0.1.0</span>
+        <div className="app__header-controls">
+          <button
+            className="app__fullscreen-btn"
+            onClick={toggleFullscreen}
+            title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          >
+            {isFullscreen ? (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3" />
+              </svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+              </svg>
+            )}
+          </button>
+          <span className="app__version">v0.1.0</span>
+        </div>
       </header>
 
       <main className="app__main">
@@ -452,6 +540,7 @@ function App() {
           onQuickWaypointCreate={handleQuickWaypointCreate}
           onCursorMove={handleCursorMove}
           onCursorLeave={handleCursorLeave}
+          onBoundsChange={handleBoundsChange}
         />
 
         {/* Layers Button - top left, second in stack */}
@@ -507,6 +596,16 @@ function App() {
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
           </svg>
         </button>
+
+        {/* Chart Selection Bar - shows charts overlapping current viewport */}
+        {chartLayers.length > 0 && (
+          <ChartBar
+            chartLayers={chartLayers}
+            viewportBounds={viewportBounds}
+            currentZoom={currentZoom}
+            onToggleChart={toggleChartLayer}
+          />
+        )}
       </main>
 
       <footer className="app__footer">
@@ -517,6 +616,7 @@ function App() {
           gpsStatus={gpsStatus}
           cursorPosition={cursorPosition}
           activeWaypoint={waypoints.find(w => w.id === activeWaypointId) || null}
+          currentZoom={currentZoom}
           onThemeChange={handleThemeChange}
           onGpsStatusClick={() => setShowGpsStatus(true)}
         />
@@ -565,10 +665,22 @@ function App() {
           onApiKeysChange={handleApiKeysChange}
           onAddChart={addChartFromFile}
           onRemoveChart={removeChartLayer}
+          onRemoveMultipleCharts={removeMultipleChartLayers}
           onToggleChart={toggleChartLayer}
           onChartOpacity={setChartLayerOpacity}
           onZoomToChart={handleZoomToChart}
+          onRefreshCharts={refreshChartLayers}
           onClose={() => setShowLayerPanel(false)}
+        />
+      )}
+
+      {/* Background import progress indicator */}
+      {backgroundImportProgress && !showLayerPanel && (
+        <ImportProgressIndicator
+          progress={backgroundImportProgress}
+          theme={theme}
+          onExpand={() => setShowLayerPanel(true)}
+          onDismiss={() => setBackgroundImportProgress(null)}
         />
       )}
     </div>
