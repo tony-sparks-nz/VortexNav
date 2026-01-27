@@ -3446,6 +3446,49 @@ body {
   margin: 4px 0;
 }
 
+.map-context-menu__subheader {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 4px 12px 2px;
+  margin-top: 2px;
+}
+
+.map-context-menu__route-group {
+  margin: 4px 0;
+}
+
+.map-context-menu__route-name {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+  padding: 4px 12px;
+  border-left: 3px solid var(--accent);
+  margin-left: 8px;
+  background: var(--surface-raised);
+}
+
+.map-context-menu__item--warning {
+  color: var(--warning, #f59e0b);
+}
+
+.map-context-menu__item--warning:hover {
+  background: var(--warning, #f59e0b);
+  color: white;
+}
+
+.map-context-menu__item--disabled {
+  padding: 0.5rem 1rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  opacity: 0.6;
+  cursor: not-allowed;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 /* Waypoint marker drag state */
 .waypoint-marker--dragging {
   transform: scale(1.2);
@@ -4231,9 +4274,19 @@ body {
   cursor: help;
 }
 
+.chart-layer-item__info-badge {
+  font-size: 0.75rem;
+  cursor: help;
+}
+
 .chart-layer-item__meta--warning {
   color: var(--warning, #ecc94b);
   font-weight: 500;
+}
+
+.chart-layer-item__meta--info {
+  color: var(--text-muted, #888);
+  font-style: italic;
 }
 
 /* ============ Catalog Manager Styles ============ */
@@ -7032,38 +7085,38 @@ body {
    Route Creation Overlay
    ============================================ */
 
+/* Route Creation Overlay - Horizontal toolbar below header */
 .route-creation-overlay {
   position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  top: 56px; /* Aligned with sidebar buttons */
+  left: 68px; /* After sidebar with small margin */
+  right: 12px; /* Small margin from edge */
+  height: 44px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 1rem;
-  min-width: 280px;
-  max-width: 320px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  padding: 0 0.75rem;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
   z-index: 300;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 0.75rem;
 }
 
 .route-creation-overlay__name {
-  position: relative;
+  flex-shrink: 0;
 }
 
 .route-creation-overlay__name-input {
-  width: 100%;
-  padding: 0.625rem 0.875rem;
+  width: 140px;
+  padding: 0.375rem 0.625rem;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-size: 0.9375rem;
+  font-size: 0.8125rem;
   font-weight: 500;
-  text-align: center;
 }
 
 .route-creation-overlay__name-input:focus {
@@ -7077,51 +7130,52 @@ body {
 
 .route-creation-overlay__stats {
   display: flex;
-  justify-content: center;
-  gap: 2rem;
-  padding: 0.5rem 0;
+  gap: 1rem;
+  padding: 0 0.75rem;
+  border-left: 1px solid var(--border);
 }
 
 .route-creation-overlay__stat {
   display: flex;
-  flex-direction: column;
-  align-items: center;
+  align-items: baseline;
+  gap: 0.25rem;
 }
 
 .route-creation-overlay__stat-value {
-  font-size: 1.5rem;
-  font-weight: 700;
+  font-size: 1rem;
+  font-weight: 600;
   color: var(--text-primary);
   line-height: 1;
 }
 
 .route-creation-overlay__stat-label {
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  margin-top: 0.25rem;
 }
 
 .route-creation-overlay__hint {
-  text-align: center;
+  flex: 1;
   font-size: 0.75rem;
   color: var(--text-secondary);
-  padding: 0.25rem 0;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--border);
 }
 
 .route-creation-overlay__actions {
   display: flex;
-  gap: 0.5rem;
-  justify-content: center;
+  gap: 0.375rem;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--border);
 }
 
 .route-creation-overlay__btn {
-  padding: 0.5rem 1rem;
+  padding: 0.375rem 0.75rem;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   font-size: 0.8125rem;
   font-weight: 500;
   cursor: pointer;
@@ -7152,16 +7206,56 @@ body {
   cursor: not-allowed;
 }
 
+/* Adjust when a side panel is open (routes, waypoints, tracks) */
+.route-creation-overlay.route-creation-overlay--panel-open {
+  right: 412px; /* Panel width (400px) + margin */
+}
+
 /* Touch-friendly adjustments */
 @media (pointer: coarse) {
   .route-creation-overlay {
-    min-width: 300px;
-    padding: 1.25rem;
+    height: 48px;
+    padding: 0 1rem;
+    gap: 0.625rem;
   }
 
   .route-creation-overlay__btn {
-    padding: 0.625rem 1.25rem;
+    padding: 0.5rem 0.875rem;
     font-size: 0.875rem;
+  }
+}
+
+/* Smaller screens: hide hint text */
+@media (max-width: 800px) {
+  .route-creation-overlay__hint {
+    display: none;
+  }
+}
+
+/* Mobile: Compact layout */
+@media (max-width: 600px) {
+  .route-creation-overlay {
+    left: 8px;
+    right: 8px;
+    top: 52px;
+    height: auto;
+    padding: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: space-between;
+  }
+
+  .route-creation-overlay.route-creation-overlay--panel-open {
+    right: 8px; /* On mobile, panel is full width overlay */
+  }
+
+  .route-creation-overlay__stats {
+    border: none;
+    padding: 0 0.5rem;
+  }
+
+  .route-creation-overlay__actions {
+    border: none;
+    padding: 0;
   }
 }
 

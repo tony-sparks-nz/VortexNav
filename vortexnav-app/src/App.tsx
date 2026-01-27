@@ -790,6 +790,19 @@ function App() {
             // Open the route panel so user can see the overlay
             setShowRoutePanel(true);
           }}
+          onInsertWaypointInRoute={async (routeId, lat, lon, insertAtIndex) => {
+            await routeManager.insertWaypointInRoute(routeId, lat, lon, insertAtIndex);
+            // Refresh waypoints list to show the new waypoint
+            await loadWaypoints();
+          }}
+          onRemoveWaypointFromRoute={(routeId, waypointId) => {
+            routeManager.removeWaypointFromRoute(routeId, waypointId);
+          }}
+          onExtendRoute={(routeId, fromEnd) => {
+            routeManager.startExtendRoute(routeId, fromEnd);
+            // Open the route panel so user can see the creation overlay
+            setShowRoutePanel(true);
+          }}
           onBoundsChange={handleBoundsChange}
           currentRouteWaypointIndex={currentRouteWaypointIndex}
           // Track props
@@ -906,9 +919,8 @@ function App() {
             }}
             highlightedChartId={highlightedChartId}
             onChartHover={(chartId) => {
-              if (showChartOutlines) {
-                setHighlightedChartId(chartId);
-              }
+              // Always set highlighted chart on hover (shows outline on map)
+              setHighlightedChartId(chartId);
             }}
           />
         )}
@@ -1038,6 +1050,7 @@ function App() {
           theme={theme}
           routeName={routeManager.state.creationMode.routeName}
           tempWaypoints={routeManager.state.creationMode.tempWaypoints}
+          rightPanelOpen={showWaypointPanel || showRoutePanel || showTrackPanel}
           onNameChange={(name) => routeManager.updateCreationName(name)}
           onUndo={() => routeManager.removeLastCreationWaypoint()}
           onCancel={() => routeManager.cancelCreationMode()}

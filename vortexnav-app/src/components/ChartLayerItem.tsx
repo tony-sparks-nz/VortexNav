@@ -13,8 +13,10 @@ interface ChartLayerItemProps {
 }
 
 // Check if a chart has complete metadata for proper display
+// Note: Antimeridian-crossing charts have zoomBounds but not bounds
 function hasCompleteMetadata(layer: ChartLayer): boolean {
-  return layer.bounds !== undefined &&
+  const hasBounds = layer.bounds !== undefined || layer.zoomBounds !== undefined;
+  return hasBounds &&
          layer.minZoom !== undefined &&
          layer.maxZoom !== undefined;
 }
@@ -29,7 +31,10 @@ export function ChartLayerItem({
   onEdit,
 }: ChartLayerItemProps) {
   const isComplete = hasCompleteMetadata(layer);
-  const missingBounds = !layer.bounds;
+  // Chart is usable if it has either bounds or zoomBounds (antimeridian charts)
+  const hasAnyBounds = layer.bounds !== undefined || layer.zoomBounds !== undefined;
+  const isAntimeridianChart = !layer.bounds && layer.zoomBounds !== undefined;
+  const missingBounds = !hasAnyBounds;
   const missingZoom = layer.minZoom === undefined || layer.maxZoom === undefined;
 
   const handleClick = (e: React.MouseEvent) => {
@@ -67,8 +72,16 @@ export function ChartLayerItem({
                 ⚠️
               </span>
             )}
+            {isAntimeridianChart && (
+              <span
+                className="chart-layer-item__info-badge"
+                title="Antimeridian-crossing chart - zoom levels may be limited"
+              >
+                🌏
+              </span>
+            )}
             {/* Show opacity percentage inline */}
-            {layer.enabled && !missingBounds && (
+            {layer.enabled && hasAnyBounds && (
               <span className="chart-layer-item__opacity-badge">
                 {Math.round(layer.opacity * 100)}%
               </span>
@@ -79,12 +92,13 @@ export function ChartLayerItem({
               {layer.name !== layer.chartId ? layer.name : (layer.type === 'vector' ? 'Vector Chart' : 'Raster Chart')}
             </span>
             {missingBounds && <span className="chart-layer-item__meta--warning">• No bounds</span>}
+            {isAntimeridianChart && <span className="chart-layer-item__meta--info">• Crosses dateline</span>}
             {missingZoom && !missingBounds && <span className="chart-layer-item__meta--warning">• No zoom range</span>}
           </div>
         </div>
 
         <div className="chart-layer-item__actions">
-          {layer.bounds && (
+          {hasAnyBounds && (
             <button
               className="chart-layer-item__btn"
               onClick={onZoomTo}

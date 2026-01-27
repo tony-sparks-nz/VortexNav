@@ -2065,21 +2065,32 @@ impl MBTilesReader {
             }
         }
 
-        // If minzoom/maxzoom are not in metadata, try to detect from tiles table
-        if metadata.minzoom.is_none() || metadata.maxzoom.is_none() {
-            match self.detect_zoom_range() {
-                Ok((detected_min, detected_max)) => {
-                    println!("MBTiles: Detected zoom range from tiles table: {}-{}", detected_min, detected_max);
-                    if metadata.minzoom.is_none() {
-                        metadata.minzoom = Some(detected_min);
-                    }
-                    if metadata.maxzoom.is_none() {
-                        metadata.maxzoom = Some(detected_max);
-                    }
+        // Always detect actual zoom range from tiles table
+        // The metadata often has incorrect/incomplete zoom values, so we use the
+        // actual tile data to determine the true zoom range
+        match self.detect_zoom_range() {
+            Ok((detected_min, detected_max)) => {
+                println!("MBTiles: Detected zoom range from tiles table: {}-{}", detected_min, detected_max);
+
+                // Use detected values if metadata is missing or if detected range is wider
+                let metadata_min = metadata.minzoom.unwrap_or(detected_min);
+                let metadata_max = metadata.maxzoom.unwrap_or(detected_max);
+
+                // Use the wider range (smaller min, larger max)
+                let final_min = std::cmp::min(metadata_min, detected_min);
+                let final_max = std::cmp::max(metadata_max, detected_max);
+
+                if metadata_min != final_min || metadata_max != final_max {
+                    println!("MBTiles: Overriding metadata zoom range ({}-{}) with detected ({}-{})",
+                        metadata_min, metadata_max, final_min, final_max);
                 }
-                Err(e) => {
-                    println!("MBTiles: Failed to detect zoom range: {:?}", e);
-                }
+
+                metadata.minzoom = Some(final_min);
+                metadata.maxzoom = Some(final_max);
+            }
+            Err(e) => {
+                println!("MBTiles: Failed to detect zoom range: {:?}", e);
+                // Fall back to metadata values if detection fails
             }
         }
 
@@ -2115,10 +2126,79 @@ impl MBTilesReader {
             "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
         )?;
 
-        let tile_data: Vec<u8> = stmt.query_row(params![z, x, tms_y], |row| row.get(0))
-            .map_err(|_| DatabaseError::TileNotFound { z, x, y })?;
+        // Try to get the tile at the requested zoom level
+        match stmt.query_row(params![z, x, tms_y], |row| row.get::<_, Vec<u8>>(0)) {
+            Ok(tile_data) => Ok(tile_data),
+            Err(_) => {
+                // Tile not found at this zoom - try to find a parent tile from a lower zoom level
+                // This handles gaps in zoom levels (e.g., Z15 exists, Z16 missing, Z17 exists)
+                self.get_fallback_tile(z, x, y)
+            }
+        }
+    }
 
-        Ok(tile_data)
+    /// Try to find a parent tile when the requested zoom level has no tile
+    /// This handles MBTiles files with gaps in zoom levels
+    fn get_fallback_tile(&self, z: u32, x: u32, y: u32) -> Result<Vec<u8>, DatabaseError> {
+        // Find available zoom levels
+        let available_zooms = self.get_available_zoom_levels()?;
+
+        if available_zooms.is_empty() {
+            return Err(DatabaseError::TileNotFound { z, x, y });
+        }
+
+        // Find the nearest lower zoom level that exists
+        let mut fallback_z = None;
+        for &zoom in available_zooms.iter().rev() {
+            if zoom < z as i32 {
+                fallback_z = Some(zoom as u32);
+                break;
+            }
+        }
+
+        // If no lower zoom level, try higher zoom levels (less ideal but better than nothing)
+        if fallback_z.is_none() {
+            for &zoom in &available_zooms {
+                if zoom > z as i32 {
+                    fallback_z = Some(zoom as u32);
+                    break;
+                }
+            }
+        }
+
+        match fallback_z {
+            Some(parent_z) => {
+                // Calculate the parent tile coordinates
+                // Each zoom level decrease halves the tile coordinates
+                let z_diff = z - parent_z;
+                let parent_x = x >> z_diff;
+                let parent_y = y >> z_diff;
+                let parent_tms_y = (1 << parent_z) - 1 - parent_y;
+
+                println!("MBTiles: Tile z{}/x{}/y{} missing, using fallback z{}/x{}/y{}",
+                    z, x, y, parent_z, parent_x, parent_y);
+
+                let mut stmt = self.conn.prepare(
+                    "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
+                )?;
+
+                stmt.query_row(params![parent_z, parent_x, parent_tms_y], |row| row.get(0))
+                    .map_err(|_| DatabaseError::TileNotFound { z, x, y })
+            }
+            None => Err(DatabaseError::TileNotFound { z, x, y })
+        }
+    }
+
+    /// Get list of available zoom levels in the tiles table
+    fn get_available_zoom_levels(&self) -> Result<Vec<i32>, DatabaseError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level"
+        )?;
+
+        let zooms: Result<Vec<i32>, _> = stmt.query_map([], |row| row.get(0))?
+            .collect();
+
+        zooms.map_err(|e| DatabaseError::Sqlite(e))
     }
 }
 

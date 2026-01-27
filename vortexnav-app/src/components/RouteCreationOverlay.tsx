@@ -5,6 +5,7 @@ interface RouteCreationOverlayProps {
   theme: ThemeMode;
   routeName: string;
   tempWaypoints: TempWaypoint[];
+  rightPanelOpen?: boolean;
   onNameChange: (name: string) => void;
   onUndo: () => void;
   onCancel: () => void;
@@ -15,6 +16,7 @@ export function RouteCreationOverlay({
   theme,
   routeName,
   tempWaypoints,
+  rightPanelOpen = false,
   onNameChange,
   onUndo,
   onCancel,
@@ -39,8 +41,14 @@ export function RouteCreationOverlay({
 
   const canFinish = tempWaypoints.length >= 2;
 
+  const className = [
+    'route-creation-overlay',
+    `route-creation-overlay--${theme}`,
+    rightPanelOpen ? 'route-creation-overlay--panel-open' : '',
+  ].filter(Boolean).join(' ');
+
   return (
-    <div className={`route-creation-overlay route-creation-overlay--${theme}`}>
+    <div className={className}>
       {/* Route name input */}
       <div className="route-creation-overlay__name">
         <input

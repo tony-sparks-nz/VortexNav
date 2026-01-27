@@ -166,6 +166,7 @@ pub fn run() {
             commands::import_selected_charts,
             commands::tag_charts_from_bsb,
             commands::fix_chart_bounds,
+            commands::recalculate_chart_bounds_from_tiles,
             // Utilities
             commands::get_app_data_dir,
         ])

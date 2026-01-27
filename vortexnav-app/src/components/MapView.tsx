@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import maplibregl, { LngLatBounds } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel, ChartLayer, WaypointDraggingState, GebcoSettings, GebcoStatus, Cm93Status, Cm93Settings, GeoJsonTile, RouteWithWaypoints, TempWaypoint, TrackWithPoints } from '../types';
@@ -80,6 +80,17 @@ interface WaypointContextMenuState {
   waypointId: number | null;
 }
 
+interface RouteContextMenuState {
+  visible: boolean;
+  x: number;
+  y: number;
+  routeId: number | null;
+  lat: number;
+  lon: number;
+  // Index where to insert waypoint (between waypoint at index-1 and index)
+  insertAtIndex: number;
+}
+
 interface MapViewProps {
   theme: ThemeMode;
   basemap: BasemapProvider;
@@ -134,6 +145,10 @@ interface MapViewProps {
   routeCreationWaypoints?: TempWaypoint[];
   onRouteCreationClick?: (lat: number, lon: number) => void;
   onRouteClick?: (routeId: number) => void;
+  // Route editing callbacks
+  onInsertWaypointInRoute?: (routeId: number, lat: number, lon: number, insertAtIndex: number) => void;
+  onRemoveWaypointFromRoute?: (routeId: number, waypointId: number) => void;
+  onExtendRoute?: (routeId: number, fromEnd: 'start' | 'end') => void;
   // Current waypoint index for active route navigation
   currentRouteWaypointIndex?: number;
   // Track display
@@ -152,6 +167,18 @@ const WAYPOINT_SYMBOL_ICONS: Record<string, string> = {
   dive: '🤿',
   beach: '🏖️',
 };
+
+// Extract short display name for waypoint markers
+// "Reef Route - WP1" -> "WP1", "Anchorage" -> "Anchorage"
+function getShortDisplayName(name: string): string {
+  // Check for route waypoint pattern: "Route Name - WP1"
+  const wpMatch = name.match(/ - (WP\d+)$/i);
+  if (wpMatch) {
+    return wpMatch[1];
+  }
+  // For regular waypoints, truncate if too long
+  return name.length > 12 ? name.substring(0, 10) + '...' : name;
+}
 
 // Generate a hash of waypoint data that affects marker appearance
 // When this hash changes, the marker needs to be recreated
@@ -173,14 +200,18 @@ function createWaypointMarkerElement(
 
   const icon = WAYPOINT_SYMBOL_ICONS[waypoint.symbol || 'default'] || '📍';
 
-  // Set tooltip with description if available
-  if (waypoint.description) {
-    container.title = waypoint.description;
-  }
+  // Set tooltip with full name (and description if available)
+  const tooltip = waypoint.description
+    ? `${waypoint.name}\n${waypoint.description}`
+    : waypoint.name;
+  container.title = tooltip;
+
+  // Use short display name for label (e.g., "WP1" instead of "Reef Route - WP1")
+  const displayName = getShortDisplayName(waypoint.name);
 
   // Only show label if both global toggle is on AND waypoint's individual show_label is true
   const labelHtml = showLabel
-    ? `<div class="waypoint-marker__label">${waypoint.name}</div>`
+    ? `<div class="waypoint-marker__label">${displayName}</div>`
     : '';
 
   container.innerHTML = `
@@ -501,6 +532,9 @@ export function MapView({
   routeCreationWaypoints = [],
   onRouteCreationClick,
   onRouteClick: _onRouteClick,
+  onInsertWaypointInRoute,
+  onRemoveWaypointFromRoute,
+  onExtendRoute,
   currentRouteWaypointIndex = 0,
   // Track props
   tracks = [],
@@ -531,6 +565,17 @@ export function MapView({
     x: 0,
     y: 0,
     waypointId: null,
+  });
+
+  // Route context menu state (for right-click on route line)
+  const [routeContextMenu, setRouteContextMenu] = useState<RouteContextMenuState>({
+    visible: false,
+    x: 0,
+    y: 0,
+    routeId: null,
+    lat: 0,
+    lon: 0,
+    insertAtIndex: 0,
   });
 
   // Track waypoint being dragged for real-time route updates
@@ -797,8 +842,9 @@ export function MapView({
       const sourceId = `mbtiles-${layer.chartId}`;
       const layerId = `mbtiles-layer-${layer.chartId}`;
 
-      // Skip charts without bounds - they can block other charts and cause rendering issues
-      if (!layer.bounds) {
+      // Skip charts without ANY bounds metadata - they can block other charts and cause rendering issues
+      // Note: Antimeridian-crossing charts have bounds=undefined but DO have zoomBounds
+      if (!layer.bounds && !layer.zoomBounds) {
         console.debug(`MapView: Skipping chart ${layer.chartId} - no bounds metadata`);
         return;
       }
@@ -810,24 +856,50 @@ export function MapView({
         try {
           // Add source if not exists
           if (!map.getSource(sourceId)) {
-            console.debug(`MapView: Adding source ${sourceId}`, {
-              tiles: `mbtiles://${layer.chartId}/{z}/{x}/{y}`,
-              minZoom: layer.minZoom,
-              maxZoom: layer.maxZoom,
-              bounds: layer.bounds
-            });
-            // Extend zoom range by 2 levels to allow for overzooming/underzooming
-            const extendedMinZoom = Math.max(0, (layer.minZoom ?? 0) - 2);
-            const extendedMaxZoom = Math.min(22, (layer.maxZoom ?? 22) + 2);
-            map.addSource(sourceId, {
+            // Determine if this is an antimeridian-crossing chart (bounds is undefined but zoomBounds exists)
+            const isAntimeridianChart = !layer.bounds && layer.zoomBounds;
+
+            // Source zoom levels from chart metadata
+            const sourceMinZoom = layer.minZoom ?? 0;
+            const sourceMaxZoom = layer.maxZoom ?? 22;
+
+            // Log ALL chart source configs for debugging
+            console.info(`MapView: Adding source ${sourceId} with minzoom=${sourceMinZoom}, maxzoom=${sourceMaxZoom}`);
+
+            if (isAntimeridianChart) {
+              console.warn(`MapView: Chart ${layer.chartId} crosses antimeridian`);
+              console.info(`MapView DIAG: ${layer.chartId} layer data:`, {
+                bounds: layer.bounds,
+                zoomBounds: layer.zoomBounds,
+                minZoom: layer.minZoom,
+                maxZoom: layer.maxZoom,
+                sourceMinZoom,
+                sourceMaxZoom
+              });
+            }
+
+            // Build source config
+            const sourceConfig: maplibregl.RasterSourceSpecification = {
               type: 'raster',
               tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
               tileSize: 256,
-              minzoom: extendedMinZoom,
-              maxzoom: extendedMaxZoom,
-              // Set bounds to limit tile requests to the chart's coverage area
-              bounds: layer.bounds,
-            });
+              minzoom: sourceMinZoom,
+              maxzoom: sourceMaxZoom,
+            };
+
+            // For antimeridian charts, set explicit bounds to help MapLibre position tiles correctly
+            // The bounds crossing the dateline (west > east when both positive, or using values > 180)
+            if (isAntimeridianChart && layer.zoomBounds) {
+              const [, south, , north] = layer.zoomBounds;
+              // Bounds that span the antimeridian: 170°E to 190°E (which is -170°W)
+              // This tells MapLibre the source covers the dateline region
+              sourceConfig.bounds = [170, south, 190, north];
+              console.info(`MapView: Antimeridian bounds for ${layer.chartId}:`, sourceConfig.bounds);
+            }
+
+            console.info(`MapView: Source config for ${layer.chartId}:`, JSON.stringify(sourceConfig));
+
+            map.addSource(sourceId, sourceConfig);
           }
 
           // Add layer if not exists
@@ -846,17 +918,14 @@ export function MapView({
               minZoom: layer.minZoom,
               maxZoom: layer.maxZoom
             });
-            // Use same extended zoom range as source
-            const layerMinZoom = Math.max(0, (layer.minZoom ?? 0) - 2);
-            const layerMaxZoom = Math.min(22, (layer.maxZoom ?? 22) + 2);
+            // No minzoom/maxzoom constraints on the layer - allow visibility at all zoom levels
+            // The source minzoom/maxzoom handles tile fetching behavior (over/underzooming)
             map.addLayer({
               id: layerId,
               type: 'raster',
               source: sourceId,
-              // Set layer zoom constraints to match source - this controls visibility
-              // Extended by 2 levels to allow over/underzooming
-              minzoom: layerMinZoom,
-              maxzoom: layerMaxZoom,
+              // No zoom constraints - chart is visible at all zoom levels
+              // Will be scaled (overzoomed/underzoomed) when outside native tile range
               paint: {
                 'raster-opacity': layer.opacity,
               },
@@ -953,8 +1022,9 @@ export function MapView({
       map.removeSource(OUTLINE_SOURCE);
     }
 
-    // If outlines are disabled, we're done
-    if (!showChartOutlines) return;
+    // If outlines are disabled AND no chart is highlighted, we're done
+    // (We still show the outline for a highlighted chart even when outlines are off)
+    if (!showChartOutlines && !highlightedChartId) return;
 
     /**
      * Analyze bounds and determine how to handle them for rendering
@@ -1020,6 +1090,9 @@ export function MapView({
     }> = [];
 
     for (const layer of chartLayers) {
+      // When outlines are disabled, only render the highlighted chart's outline
+      if (!showChartOutlines && layer.chartId !== highlightedChartId) continue;
+
       // Use rawBoundsString to get original bounds for outline rendering
       const boundsStr = layer.rawBoundsString;
       if (!boundsStr) continue;
@@ -1273,7 +1346,8 @@ export function MapView({
     }
 
     // Add zoom level labels at bottom-right of each chart frame
-    if (labelFeatures.length > 0) {
+    // Only show labels when full outlines mode is enabled (not just on hover)
+    if (showChartOutlines && labelFeatures.length > 0) {
       map.addSource(OUTLINE_LABELS_SOURCE, {
         type: 'geojson',
         data: {
@@ -1313,7 +1387,8 @@ export function MapView({
     }
 
     // Add toggle buttons at top-right of each chart frame
-    if (buttonFeatures.length > 0) {
+    // Only show buttons when full outlines mode is enabled (not just on hover)
+    if (showChartOutlines && buttonFeatures.length > 0) {
       map.addSource(OUTLINE_BUTTONS_SOURCE, {
         type: 'geojson',
         data: {
@@ -2601,10 +2676,11 @@ export function MapView({
     const marker = waypointMarkersRef.current.get(editingPreview.id);
     if (marker) {
       const el = marker.getElement();
-      // Update the label
+      // Update the label with short display name
       const labelEl = el.querySelector('.waypoint-marker__label');
       if (labelEl) {
-        labelEl.textContent = editingPreview.name || 'Waypoint';
+        const displayName = getShortDisplayName(editingPreview.name || 'Waypoint');
+        labelEl.textContent = displayName;
       }
       // Update the icon/symbol
       const iconEl = el.querySelector('.waypoint-marker__icon');
@@ -2612,8 +2688,11 @@ export function MapView({
         const icon = WAYPOINT_SYMBOL_ICONS[editingPreview.symbol] || WAYPOINT_SYMBOL_ICONS['default'];
         iconEl.textContent = icon;
       }
-      // Update the tooltip (description)
-      el.title = editingPreview.description || '';
+      // Update the tooltip with full name and description
+      const tooltip = editingPreview.description
+        ? `${editingPreview.name}\n${editingPreview.description}`
+        : editingPreview.name || '';
+      el.title = tooltip;
     }
   }, [editingPreview]);
 
@@ -3004,6 +3083,131 @@ export function MapView({
     });
   }, [routes, activeRouteId, mapLoaded, draggingWaypointState, waypoints]);
 
+  // ============ ROUTE LINE CLICK HANDLERS ============
+  // Handle right-click on route lines to show context menu
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const routeLayerId = 'routes-layer';
+    const activeRouteLayerId = 'active-route-layer';
+
+    // Find which segment of a route was clicked (returns index where to insert)
+    const findSegmentIndex = (routeId: number, clickLngLat: maplibregl.LngLat): number => {
+      const routeWithWaypoints = routes.find(r => r.route.id === routeId);
+      if (!routeWithWaypoints || routeWithWaypoints.waypoints.length < 2) return 1;
+
+      const routeWaypoints = routeWithWaypoints.waypoints;
+      let minDist = Infinity;
+      let bestIndex = 1;
+
+      // Check distance to each segment
+      for (let i = 0; i < routeWaypoints.length - 1; i++) {
+        const wp1 = routeWaypoints[i];
+        const wp2 = routeWaypoints[i + 1];
+
+        // Calculate distance from point to line segment
+        const dist = pointToSegmentDistance(
+          clickLngLat.lat, clickLngLat.lng,
+          wp1.lat, wp1.lon,
+          wp2.lat, wp2.lon
+        );
+
+        if (dist < minDist) {
+          minDist = dist;
+          bestIndex = i + 1; // Insert after waypoint at index i
+        }
+      }
+
+      return bestIndex;
+    };
+
+    // Simple point-to-segment distance calculation
+    const pointToSegmentDistance = (
+      pLat: number, pLon: number,
+      aLat: number, aLon: number,
+      bLat: number, bLon: number
+    ): number => {
+      const dx = bLon - aLon;
+      const dy = bLat - aLat;
+      const lenSq = dx * dx + dy * dy;
+
+      if (lenSq === 0) {
+        // Segment is a point
+        return Math.sqrt((pLon - aLon) ** 2 + (pLat - aLat) ** 2);
+      }
+
+      // Project point onto line
+      const t = Math.max(0, Math.min(1, ((pLon - aLon) * dx + (pLat - aLat) * dy) / lenSq));
+      const projLon = aLon + t * dx;
+      const projLat = aLat + t * dy;
+
+      return Math.sqrt((pLon - projLon) ** 2 + (pLat - projLat) ** 2);
+    };
+
+    // Right-click handler for route lines
+    const handleRouteContextMenu = (e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }) => {
+      // Don't show route context menu during route creation
+      if (routeCreationModeActive) return;
+
+      const features = e.features;
+      if (!features || features.length === 0) return;
+
+      const feature = features[0];
+      const routeId = feature.properties?.routeId as number | undefined;
+      if (routeId === undefined) return;
+
+      e.preventDefault();
+
+      const rect = mapContainer.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const insertAtIndex = findSegmentIndex(routeId, e.lngLat);
+
+      setRouteContextMenu({
+        visible: true,
+        x: e.point.x,
+        y: e.point.y,
+        routeId,
+        lat: e.lngLat.lat,
+        lon: e.lngLat.lng,
+        insertAtIndex,
+      });
+
+      // Close other context menus
+      setContextMenu(prev => ({ ...prev, visible: false }));
+      setWaypointContextMenu(prev => ({ ...prev, visible: false }));
+    };
+
+    // Change cursor on hover over route lines
+    const handleRouteMouseEnter = () => {
+      map.getCanvas().style.cursor = 'pointer';
+    };
+
+    const handleRouteMouseLeave = () => {
+      map.getCanvas().style.cursor = '';
+    };
+
+    // Add event listeners for both route layers
+    [routeLayerId, activeRouteLayerId].forEach(layerId => {
+      if (map.getLayer(layerId)) {
+        map.on('contextmenu', layerId, handleRouteContextMenu);
+        map.on('mouseenter', layerId, handleRouteMouseEnter);
+        map.on('mouseleave', layerId, handleRouteMouseLeave);
+      }
+    });
+
+    return () => {
+      [routeLayerId, activeRouteLayerId].forEach(layerId => {
+        if (map.getLayer(layerId)) {
+          map.off('contextmenu', layerId, handleRouteContextMenu);
+          map.off('mouseenter', layerId, handleRouteMouseEnter);
+          map.off('mouseleave', layerId, handleRouteMouseLeave);
+        }
+      });
+    };
+  }, [mapLoaded, routes, routeCreationModeActive]);
+
   // ============ TRACK POLYLINES ============
   // Render recorded tracks as polylines on the map
   useEffect(() => {
@@ -3318,12 +3522,37 @@ export function MapView({
   const handleCloseContextMenu = () => {
     setContextMenu((prev) => ({ ...prev, visible: false }));
     setWaypointContextMenu((prev) => ({ ...prev, visible: false }));
+    setRouteContextMenu((prev) => ({ ...prev, visible: false }));
   };
 
   // Close waypoint context menu
   const handleCloseWaypointContextMenu = () => {
     setWaypointContextMenu((prev) => ({ ...prev, visible: false }));
   };
+
+  // Close route context menu
+  const handleCloseRouteContextMenu = () => {
+    setRouteContextMenu((prev) => ({ ...prev, visible: false }));
+  };
+
+  // Helper: Find routes that contain a specific waypoint
+  const getRoutesForWaypoint = useCallback((waypointId: number) => {
+    return routes.filter(r => r.waypoints.some(wp => wp.id === waypointId));
+  }, [routes]);
+
+  // Helper: Check if waypoint is at the start or end of a route
+  const getWaypointPositionInRoute = useCallback((routeWithWaypoints: RouteWithWaypoints, waypointId: number): 'start' | 'end' | 'middle' | null => {
+    const { waypoints: routeWaypoints } = routeWithWaypoints;
+    if (routeWaypoints.length === 0) return null;
+
+    const firstWp = routeWaypoints[0];
+    const lastWp = routeWaypoints[routeWaypoints.length - 1];
+
+    if (firstWp.id === waypointId) return 'start';
+    if (lastWp.id === waypointId) return 'end';
+    if (routeWaypoints.some(wp => wp.id === waypointId)) return 'middle';
+    return null;
+  }, []);
 
   // Handle waypoint delete from context menu
   const handleWaypointDelete = () => {
@@ -3395,9 +3624,48 @@ export function MapView({
     });
   };
 
+  // Handle removing waypoint from a route
+  const handleRemoveWaypointFromRoute = (routeId: number) => {
+    if (waypointContextMenu.waypointId !== null && onRemoveWaypointFromRoute) {
+      onRemoveWaypointFromRoute(routeId, waypointContextMenu.waypointId);
+    }
+    handleCloseWaypointContextMenu();
+  };
+
+  // Handle extending a route from an end waypoint
+  const handleExtendRoute = (routeId: number, fromEnd: 'start' | 'end') => {
+    if (onExtendRoute) {
+      onExtendRoute(routeId, fromEnd);
+    }
+    handleCloseWaypointContextMenu();
+  };
+
+  // Handle inserting waypoint on route line
+  const handleInsertWaypointOnRoute = () => {
+    if (routeContextMenu.routeId !== null && onInsertWaypointInRoute) {
+      onInsertWaypointInRoute(
+        routeContextMenu.routeId,
+        routeContextMenu.lat,
+        routeContextMenu.lon,
+        routeContextMenu.insertAtIndex
+      );
+    }
+    handleCloseRouteContextMenu();
+  };
+
   // Get waypoint name for context menu header
   const contextMenuWaypoint = waypointContextMenu.waypointId !== null
     ? waypoints.find(w => w.id === waypointContextMenu.waypointId)
+    : null;
+
+  // Get routes containing the context menu waypoint
+  const contextMenuWaypointRoutes = waypointContextMenu.waypointId !== null
+    ? getRoutesForWaypoint(waypointContextMenu.waypointId)
+    : [];
+
+  // Get route info for route context menu
+  const contextMenuRoute = routeContextMenu.routeId !== null
+    ? routes.find(r => r.route.id === routeContextMenu.routeId)
     : null;
 
   return (
@@ -3529,6 +3797,54 @@ export function MapView({
             <span className="map-context-menu__icon">{contextMenuWaypoint?.hidden ? '👁️' : '👁️‍🗨️'}</span>
             <span>{contextMenuWaypoint?.hidden ? 'Show on map' : 'Hide from map'}</span>
           </button>
+
+          {/* Route-specific options for this waypoint */}
+          {contextMenuWaypointRoutes.length > 0 && onRemoveWaypointFromRoute && (
+            <>
+              <div className="map-context-menu__divider" />
+              <div className="map-context-menu__subheader">Routes</div>
+              {contextMenuWaypointRoutes.map((routeWithWaypoints: RouteWithWaypoints) => {
+                const route = routeWithWaypoints.route;
+                const position = getWaypointPositionInRoute(routeWithWaypoints, waypointContextMenu.waypointId!);
+                const isEndWaypoint = position === 'start' || position === 'end';
+                const canDelete = routeWithWaypoints.waypoints.length > 2; // Keep at least 2 waypoints
+
+                return (
+                  <div key={route.id} className="map-context-menu__route-group">
+                    <div className="map-context-menu__route-name" style={{ borderLeftColor: route.color || '#c026d3' }}>
+                      {route.name}
+                    </div>
+                    {isEndWaypoint && onExtendRoute && (
+                      <button
+                        className="map-context-menu__item"
+                        onClick={() => handleExtendRoute(route.id!, position as 'start' | 'end')}
+                      >
+                        <span className="map-context-menu__icon">➕</span>
+                        <span>Extend route</span>
+                      </button>
+                    )}
+                    {canDelete && (
+                      <button
+                        className="map-context-menu__item map-context-menu__item--warning"
+                        onClick={() => handleRemoveWaypointFromRoute(route.id!)}
+                      >
+                        <span className="map-context-menu__icon">✂️</span>
+                        <span>Remove from route</span>
+                      </button>
+                    )}
+                    {!canDelete && (
+                      <div className="map-context-menu__item map-context-menu__item--disabled">
+                        <span className="map-context-menu__icon">⚠️</span>
+                        <span>Min 2 waypoints</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
+
+          <div className="map-context-menu__divider" />
           <button
             className="map-context-menu__item map-context-menu__item--danger"
             onClick={handleWaypointDelete}
@@ -3536,6 +3852,33 @@ export function MapView({
             <span className="map-context-menu__icon">🗑️</span>
             <span>Delete waypoint</span>
           </button>
+        </div>
+      )}
+
+      {/* Route Line Context Menu */}
+      {routeContextMenu.visible && routeContextMenu.routeId !== null && contextMenuRoute && (
+        <div
+          className={`map-context-menu map-context-menu--${theme}`}
+          style={{
+            position: 'absolute',
+            left: routeContextMenu.x,
+            top: routeContextMenu.y,
+            zIndex: 1000,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="map-context-menu__header" style={{ borderLeftColor: contextMenuRoute.route.color || '#c026d3' }}>
+            {contextMenuRoute.route.name}
+          </div>
+          {onInsertWaypointInRoute && (
+            <button
+              className="map-context-menu__item"
+              onClick={handleInsertWaypointOnRoute}
+            >
+              <span className="map-context-menu__icon">📍</span>
+              <span>Insert waypoint here</span>
+            </button>
+          )}
         </div>
       )}
     </div>

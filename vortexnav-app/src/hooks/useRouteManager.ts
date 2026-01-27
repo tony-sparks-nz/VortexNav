@@ -208,14 +208,22 @@ function routeReducer(
         },
       };
 
-    case 'UPDATE_CREATION_NAME':
+    case 'UPDATE_CREATION_NAME': {
+      // Rename all existing temp waypoints when route name changes
+      const newRouteName = action.payload || 'Route';
+      const renamedWaypoints = state.creationMode.tempWaypoints.map((wp, index) => ({
+        ...wp,
+        name: `${newRouteName} - WP${index + 1}`,
+      }));
       return {
         ...state,
         creationMode: {
           ...state.creationMode,
           routeName: action.payload,
+          tempWaypoints: renamedWaypoints,
         },
       };
+    }
 
     case 'CANCEL_CREATION_MODE':
       return {
@@ -400,6 +408,13 @@ export function useRouteManager() {
 
   // Temp waypoint counter for unique IDs
   const tempWaypointCounter = useRef(0);
+
+  // Track route extension state (when extending an existing route)
+  const extendingRouteRef = useRef<{
+    routeId: number;
+    fromEnd: 'start' | 'end';
+    originalWaypointIds: number[];
+  } | null>(null);
 
   // ============ Memoized Selectors ============
 
@@ -732,6 +747,172 @@ export function useRouteManager() {
     }
   }, []);
 
+  /**
+   * Remove a waypoint from a route.
+   * The route must have at least 2 waypoints after removal.
+   */
+  const removeWaypointFromRoute = useCallback(async (routeId: number, waypointId: number) => {
+    if (!isTauri()) return;
+
+    // Find the route
+    const routeWithWaypoints = stateRef.current.routes.find(r => r.route.id === routeId);
+    if (!routeWithWaypoints) {
+      console.error('Route not found:', routeId);
+      return;
+    }
+
+    // Check that route has at least 3 waypoints (will have 2 after removal)
+    if (routeWithWaypoints.waypoints.length < 3) {
+      console.error('Cannot remove waypoint: route must have at least 2 waypoints');
+      return;
+    }
+
+    // Filter out the waypoint to remove
+    const newWaypointIds = routeWithWaypoints.waypoints
+      .filter(wp => wp.id !== waypointId)
+      .map(wp => wp.id!)
+      .filter((id): id is number => id !== null);
+
+    if (newWaypointIds.length < 2) {
+      console.error('Cannot remove waypoint: would leave route with fewer than 2 waypoints');
+      return;
+    }
+
+    try {
+      // Update the route with the new waypoint list
+      await updateRouteApi(
+        routeWithWaypoints.route,
+        newWaypointIds,
+        routeWithWaypoints.tags.map(t => t.id!).filter((id): id is number => id !== null)
+      );
+
+      // Reload routes to get fresh data
+      const freshRoutes = await getRoutes();
+      dispatch({ type: 'SAVE_SUCCESS', payload: freshRoutes });
+    } catch (error) {
+      console.error('Failed to remove waypoint from route:', error);
+    }
+  }, []);
+
+  /**
+   * Insert a waypoint into a route at a specific position.
+   * Creates a new waypoint at the given coordinates and inserts it.
+   * @param routeId - The route to modify
+   * @param lat - Latitude for the new waypoint
+   * @param lon - Longitude for the new waypoint
+   * @param insertAtIndex - Position to insert (0 = start, waypoints.length = end)
+   */
+  const insertWaypointInRoute = useCallback(async (
+    routeId: number,
+    lat: number,
+    lon: number,
+    insertAtIndex: number
+  ) => {
+    if (!isTauri()) return;
+
+    // Find the route
+    const routeWithWaypoints = stateRef.current.routes.find(r => r.route.id === routeId);
+    if (!routeWithWaypoints) {
+      console.error('Route not found:', routeId);
+      return;
+    }
+
+    try {
+      // Create a new waypoint at the specified location
+      const waypointName = `${routeWithWaypoints.route.name} - WP${routeWithWaypoints.waypoints.length + 1}`;
+      const newWaypointId = await createWaypoint({
+        name: waypointName,
+        lat,
+        lon,
+        description: null,
+        symbol: 'route-point',
+        show_label: true,
+        hidden: false,
+      });
+
+      // Build the new waypoint ID list with the new waypoint inserted
+      const currentWaypointIds = routeWithWaypoints.waypoints
+        .map(wp => wp.id!)
+        .filter((id): id is number => id !== null);
+
+      // Clamp insertAtIndex to valid range
+      const clampedIndex = Math.max(0, Math.min(insertAtIndex, currentWaypointIds.length));
+      const newWaypointIds = [
+        ...currentWaypointIds.slice(0, clampedIndex),
+        newWaypointId,
+        ...currentWaypointIds.slice(clampedIndex),
+      ];
+
+      // Update the route with the new waypoint list
+      await updateRouteApi(
+        routeWithWaypoints.route,
+        newWaypointIds,
+        routeWithWaypoints.tags.map(t => t.id!).filter((id): id is number => id !== null)
+      );
+
+      // Reload routes to get fresh data
+      const freshRoutes = await getRoutes();
+      dispatch({ type: 'SAVE_SUCCESS', payload: freshRoutes });
+    } catch (error) {
+      console.error('Failed to insert waypoint in route:', error);
+    }
+  }, []);
+
+  /**
+   * Start extending a route from one of its ends.
+   * This enters map creation mode with existing waypoints pre-loaded.
+   * @param routeId - The route to extend
+   * @param fromEnd - 'start' to add waypoints before the first, 'end' to add after the last
+   */
+  const startExtendRoute = useCallback((routeId: number, fromEnd: 'start' | 'end') => {
+    const routeWithWaypoints = stateRef.current.routes.find(r => r.route.id === routeId);
+    if (!routeWithWaypoints) {
+      console.error('Route not found:', routeId);
+      return;
+    }
+
+    // Convert existing waypoints to temp waypoints
+    const existingWaypoints = routeWithWaypoints.waypoints;
+    const tempWaypoints: TempWaypoint[] = existingWaypoints.map((wp) => ({
+      id: `existing-${wp.id}`,
+      name: wp.name,
+      lat: wp.lat,
+      lon: wp.lon,
+    }));
+
+    // Reset counter based on existing waypoints
+    tempWaypointCounter.current = existingWaypoints.length;
+
+    // Start creation mode with pre-loaded waypoints
+    // Store the original route ID and extension direction for when we finish
+    dispatch({
+      type: 'START_CREATE_ON_MAP',
+      payload: routeWithWaypoints.route.name,
+    });
+
+    // Load the existing waypoints (in correct order based on extension direction)
+    if (fromEnd === 'start') {
+      // When extending from start, new waypoints will be added at the beginning
+      // For now, we just load the waypoints and user will click to add new ones
+      // The new waypoints get prepended
+      tempWaypoints.forEach(tw => {
+        dispatch({ type: 'ADD_CREATION_WAYPOINT', payload: tw });
+      });
+    } else {
+      // When extending from end, new waypoints will be added at the end
+      tempWaypoints.forEach(tw => {
+        dispatch({ type: 'ADD_CREATION_WAYPOINT', payload: tw });
+      });
+    }
+
+    // Store metadata about the extension
+    extendingRouteRef.current = {
+      routeId,
+      fromEnd,
+      originalWaypointIds: existingWaypoints.map(wp => wp.id!).filter((id): id is number => id !== null),
+    };
+  }, []);
+
   const setActiveRoute = useCallback(async (routeId: number | null) => {
     if (!isTauri()) return;
 
@@ -859,6 +1040,9 @@ export function useRouteManager() {
     getExclusiveWaypointCount,
     duplicateRoute,
     reverseRoute,
+    removeWaypointFromRoute,
+    insertWaypointInRoute,
+    startExtendRoute,
     setActiveRoute,
     toggleActiveRoute,
     toggleRouteHidden,

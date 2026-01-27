@@ -35,7 +35,14 @@ export function registerMBTilesProtocol(): void {
 
     try {
       // Request tile from Tauri backend
-      console.debug(`Requesting tile: ${chartId}/${z}/${x}/${y}`);
+      // Use info-level logging for antimeridian diagnostic (NZ1463801)
+      const isAntimeridianDiag = chartId.includes('NZ1463801');
+      if (isAntimeridianDiag) {
+        console.info(`MBTiles DIAG: Requesting ${chartId}/z${z}/x${x}/y${y}`);
+      } else {
+        console.debug(`MBTiles: Requesting ${chartId}/${z}/${x}/${y}`);
+      }
+
       const tileData = await invoke<number[]>('get_tile', {
         chartId,
         z,
@@ -43,7 +50,11 @@ export function registerMBTilesProtocol(): void {
         y,
       });
 
-      console.debug(`Tile received: ${chartId}/${z}/${x}/${y}, size: ${tileData.length} bytes`);
+      if (isAntimeridianDiag) {
+        console.info(`MBTiles DIAG: Received ${chartId}/z${z}/x${x}/y${y}, ${tileData.length} bytes`);
+      } else {
+        console.debug(`MBTiles: Received ${chartId}/${z}/${x}/${y}, ${tileData.length} bytes`);
+      }
 
       // Convert number array to Uint8Array then to ArrayBuffer
       const uint8Array = new Uint8Array(tileData);
@@ -54,7 +65,12 @@ export function registerMBTilesProtocol(): void {
     } catch (error) {
       // Return empty tile for missing tiles (common in sparse tilesets)
       // MapLibre will handle this gracefully
-      console.debug(`Tile not found or error: ${chartId}/${z}/${x}/${y}`, error);
+      const isAntimeridianDiag = chartId.includes('NZ1463801');
+      if (isAntimeridianDiag) {
+        console.info(`MBTiles DIAG: Tile not found ${chartId}/z${z}/x${x}/y${y}`, error);
+      } else {
+        console.debug(`Tile not found or error: ${chartId}/${z}/${x}/${y}`, error);
+      }
       return {
         data: new ArrayBuffer(0),
       };

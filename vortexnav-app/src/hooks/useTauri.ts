@@ -1023,6 +1023,19 @@ export async function removeChart(chartId: string): Promise<void> {
   }
 }
 
+/**
+ * Recalculate chart bounds from tile extent in the MBTiles file.
+ * Useful for fixing antimeridian-crossing charts that have incorrect bounds.
+ * Returns the new bounds string.
+ */
+export async function recalculateChartBoundsFromTiles(chartId: string): Promise<string> {
+  const result = await invoke<CommandResult<string>>('recalculate_chart_bounds_from_tiles', { chartId });
+  if (!result.success || !result.data) {
+    throw new Error(result.error || 'Failed to recalculate chart bounds');
+  }
+  return result.data;
+}
+
 // Chart layer state for persistence
 export interface ChartLayerStateInput {
   chartId: string;

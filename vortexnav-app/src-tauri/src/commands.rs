@@ -1611,6 +1611,155 @@ pub fn remove_chart(chart_id: String, state: State<AppState>) -> CommandResult<(
     CommandResult::ok(())
 }
 
+/// Recalculate chart bounds by analyzing tile extent in the MBTiles file
+/// This is especially useful for antimeridian-crossing charts that have incorrect bounds
+/// It works without needing the original KAP files
+#[tauri::command]
+pub fn recalculate_chart_bounds_from_tiles(chart_id: String, state: State<AppState>) -> CommandResult<String> {
+    let chart_path = state.charts_dir.join(format!("{}.mbtiles", chart_id));
+
+    if !chart_path.exists() {
+        return CommandResult::err(&format!("Chart not found: {}", chart_id));
+    }
+
+    // Open the MBTiles database
+    let conn = match rusqlite::Connection::open(&chart_path) {
+        Ok(c) => c,
+        Err(e) => return CommandResult::err(&format!("Failed to open chart: {}", e)),
+    };
+
+    // Get the max zoom level to query tiles from
+    let max_zoom: i32 = match conn.query_row(
+        "SELECT MAX(zoom_level) FROM tiles",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(z) => z,
+        Err(e) => return CommandResult::err(&format!("Failed to get zoom levels: {}", e)),
+    };
+
+    // Get tile extent at max zoom
+    let extent: (i32, i32, i32, i32) = match conn.query_row(
+        "SELECT MIN(tile_column), MAX(tile_column), MIN(tile_row), MAX(tile_row) FROM tiles WHERE zoom_level = ?",
+        [max_zoom],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ) {
+        Ok(e) => e,
+        Err(e) => return CommandResult::err(&format!("Failed to get tile extent: {}", e)),
+    };
+
+    let (min_x, max_x, min_y_tms, max_y_tms) = extent;
+    let n = 1 << max_zoom; // 2^zoom
+
+    // Convert tile coordinates to geographic bounds
+    // MBTiles uses TMS (origin at bottom-left), MapLibre uses XYZ (origin at top-left)
+    // Convert TMS y to XYZ y: xyz_y = (1 << z) - 1 - tms_y
+    let min_y_xyz = n - 1 - max_y_tms;
+    let max_y_xyz = n - 1 - min_y_tms;
+
+    // Calculate geographic bounds from tile coordinates
+    let min_lon = (min_x as f64 / n as f64) * 360.0 - 180.0;
+    let max_lon = ((max_x + 1) as f64 / n as f64) * 360.0 - 180.0;
+
+    // Web Mercator to WGS84 latitude conversion
+    fn tile_to_lat(y: i32, n: i32) -> f64 {
+        let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n as f64)).sinh().atan();
+        lat_rad.to_degrees()
+    }
+
+    let min_lat = tile_to_lat(max_y_xyz + 1, n);
+    let max_lat = tile_to_lat(min_y_xyz, n);
+
+    log::info!("Chart {} tile extent at z={}: x=[{},{}], y_tms=[{},{}]",
+        chart_id, max_zoom, min_x, max_x, min_y_tms, max_y_tms);
+    log::info!("Chart {} raw bounds: lon=[{:.4}, {:.4}], lat=[{:.4}, {:.4}]",
+        chart_id, min_lon, max_lon, min_lat, max_lat);
+
+    // Detect antimeridian-crossing chart
+    // If tiles span from near 0 (western edge) to near 2^zoom-1 (eastern edge)
+    // but there's a gap in the middle, it's crossing the antimeridian
+    let tile_span = max_x - min_x;
+    let total_tiles = n;
+    let crosses_antimeridian = tile_span > total_tiles / 2;
+
+    let bounds_str = if crosses_antimeridian {
+        // For antimeridian charts, we need to find the actual extent
+        // Get all unique x values to find the gap
+        let mut x_values: Vec<i32> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT tile_column FROM tiles WHERE zoom_level = ? ORDER BY tile_column"
+            ).map_err(|e| format!("Failed to prepare query: {}", e)).unwrap();
+
+            let rows = stmt.query_map([max_zoom], |row| row.get(0))
+                .map_err(|e| format!("Failed to query tiles: {}", e)).unwrap();
+
+            for row in rows {
+                if let Ok(x) = row {
+                    x_values.push(x);
+                }
+            }
+        }
+
+        // Find the largest gap between consecutive x values
+        let mut max_gap = 0;
+        let mut gap_start = 0;
+        for i in 0..x_values.len() - 1 {
+            let gap = x_values[i + 1] - x_values[i];
+            if gap > max_gap {
+                max_gap = gap;
+                gap_start = x_values[i];
+            }
+        }
+
+        // The western edge is after the gap, eastern edge is before the gap
+        // Western tiles: those after gap_start (high x values, near 180°)
+        // Eastern tiles: those before the gap (low x values, near -180°)
+        let western_min_x = gap_start + 1; // First tile after gap (if gap exists)
+        let eastern_max_x = if gap_start > 0 { x_values.iter().filter(|&&x| x < gap_start).max().copied().unwrap_or(0) } else { 0 };
+
+        // If we have tiles on both sides of the antimeridian
+        if max_gap > 1 && western_min_x < n && eastern_max_x < western_min_x {
+            // Western bound (positive longitude side)
+            let west_lon = (western_min_x as f64 / n as f64) * 360.0 - 180.0;
+            // Eastern bound (negative longitude side, but we express as >180)
+            let east_lon = ((eastern_max_x + 1) as f64 / n as f64) * 360.0 - 180.0 + 360.0;
+
+            log::info!("Chart {} CROSSES ANTIMERIDIAN: west_lon={:.4}, east_lon={:.4} (normalized to >180)",
+                chart_id, west_lon, east_lon);
+
+            format!("{:.6},{:.6},{:.6},{:.6}", west_lon, min_lat, east_lon, max_lat)
+        } else {
+            // Fallback to standard bounds
+            format!("{:.6},{:.6},{:.6},{:.6}", min_lon, min_lat, max_lon, max_lat)
+        }
+    } else {
+        // Standard chart
+        format!("{:.6},{:.6},{:.6},{:.6}", min_lon, min_lat, max_lon, max_lat)
+    };
+
+    // Update the bounds in metadata
+    let result = conn.execute(
+        "INSERT OR REPLACE INTO metadata (name, value) VALUES ('bounds', ?)",
+        [&bounds_str],
+    );
+
+    match result {
+        Ok(_) => {
+            log::info!("Chart {} bounds updated to: {}", chart_id, bounds_str);
+
+            // Clear the cached reader so it reloads with new metadata
+            {
+                let mut readers = state.mbtiles_readers.lock().unwrap();
+                readers.remove(&chart_id);
+            }
+
+            CommandResult::ok(bounds_str)
+        }
+        Err(e) => CommandResult::err(&format!("Failed to update bounds: {}", e)),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChartLayerStateInput {
     pub chart_id: String,
@@ -3424,10 +3573,36 @@ fn parse_gdalinfo_bounds(info_str: &str) -> Option<(f64, f64, f64, f64)> {
             }
 
             if !lons.is_empty() && !lats.is_empty() {
-                let min_lon = lons.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max_lon = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let min_lat = lats.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_lat = lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+                // Check if this chart crosses the antimeridian (international date line)
+                // An antimeridian-crossing chart has coordinates on both sides (positive and negative)
+                // with a large gap in the middle
+                let has_positive = lons.iter().any(|&lon| lon > 90.0);
+                let has_negative = lons.iter().any(|&lon| lon < -90.0);
+                let crosses_antimeridian = has_positive && has_negative;
+
+                let (min_lon, max_lon) = if crosses_antimeridian {
+                    // For antimeridian charts, normalize all negative longitudes to >180
+                    // e.g., -174 becomes 186 (360 + -174)
+                    let normalized: Vec<f64> = lons.iter()
+                        .map(|&lon| if lon < 0.0 { lon + 360.0 } else { lon })
+                        .collect();
+
+                    let norm_min = normalized.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let norm_max = normalized.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+                    log::info!("Chart CROSSES ANTIMERIDIAN: normalized bounds lon=[{}, {}]",
+                        norm_min, norm_max);
+
+                    (norm_min, norm_max)
+                } else {
+                    // Standard chart - use simple min/max
+                    let simple_min = lons.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let simple_max = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    (simple_min, simple_max)
+                };
 
                 return Some((min_lon, min_lat, max_lon, max_lat));
             }

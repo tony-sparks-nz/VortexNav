@@ -277,14 +277,42 @@ fn get_chart_bounds(input_path: &Path) -> Option<(f64, f64, f64, f64)> {
             }
 
             if !lons.is_empty() && !lats.is_empty() {
-                let min_lon = lons.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max_lon = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let min_lat = lats.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_lat = lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-                log::info!("Chart {} bounds: lon=[{}, {}], lat=[{}, {}]",
+                // Check if this chart crosses the antimeridian (international date line)
+                // An antimeridian-crossing chart has coordinates on both sides (positive and negative)
+                // with a large gap in the middle
+                let has_positive = lons.iter().any(|&lon| lon > 90.0);
+                let has_negative = lons.iter().any(|&lon| lon < -90.0);
+                let crosses_antimeridian = has_positive && has_negative;
+
+                let (min_lon, max_lon) = if crosses_antimeridian {
+                    // For antimeridian charts, normalize all negative longitudes to >180
+                    // e.g., -174 becomes 186 (360 + -174)
+                    let normalized: Vec<f64> = lons.iter()
+                        .map(|&lon| if lon < 0.0 { lon + 360.0 } else { lon })
+                        .collect();
+
+                    let norm_min = normalized.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let norm_max = normalized.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+                    log::info!("Chart {} CROSSES ANTIMERIDIAN: normalized bounds lon=[{}, {}]",
+                        input_path.file_name().unwrap_or_default().to_string_lossy(),
+                        norm_min, norm_max);
+
+                    (norm_min, norm_max)
+                } else {
+                    // Standard chart - use simple min/max
+                    let simple_min = lons.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let simple_max = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    (simple_min, simple_max)
+                };
+
+                log::info!("Chart {} bounds: lon=[{}, {}], lat=[{}, {}]{}",
                     input_path.file_name().unwrap_or_default().to_string_lossy(),
-                    min_lon, max_lon, min_lat, max_lat);
+                    min_lon, max_lon, min_lat, max_lat,
+                    if crosses_antimeridian { " (antimeridian)" } else { "" });
 
                 return Some((min_lon, min_lat, max_lon, max_lat));
             }
@@ -360,6 +388,76 @@ pub fn write_mbtiles_metadata(mbtiles_path: &Path, name: &str, value: &str) -> R
     Ok(())
 }
 
+/// Check if chart bounds cross the antimeridian
+fn crosses_antimeridian(bounds: Option<(f64, f64, f64, f64)>) -> bool {
+    if let Some((min_lon, _, max_lon, _)) = bounds {
+        // If max_lon > 180, it's already in extended format (crosses antimeridian)
+        if max_lon > 180.0 {
+            return true;
+        }
+        // If we have both far positive and far negative longitudes
+        if min_lon < -90.0 && max_lon > 90.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Convert WGS84 longitude to Web Mercator X coordinate
+fn lon_to_webmerc(lon: f64) -> f64 {
+    // Web Mercator X at 180° = 20037508.342789244
+    const WEBMERC_HALF_WORLD: f64 = 20037508.342789244;
+    lon * WEBMERC_HALF_WORLD / 180.0
+}
+
+/// Convert WGS84 latitude to Web Mercator Y coordinate
+fn lat_to_webmerc(lat: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6378137.0;
+    let lat_rad = lat * std::f64::consts::PI / 180.0;
+    EARTH_RADIUS * (std::f64::consts::PI / 4.0 + lat_rad / 2.0).tan().ln()
+}
+
+/// Merge tiles from source MBTiles into destination MBTiles
+/// Used for combining split antimeridian chart halves
+fn merge_mbtiles(dest_path: &Path, source_path: &Path) -> Result<(), String> {
+    use rusqlite::Connection;
+
+    let dest_conn = Connection::open(dest_path)
+        .map_err(|e| format!("Failed to open destination MBTiles: {}", e))?;
+
+    let source_conn = Connection::open(source_path)
+        .map_err(|e| format!("Failed to open source MBTiles: {}", e))?;
+
+    // Copy tiles from source to destination
+    // MBTiles uses TMS y-coordinate convention
+    let mut stmt = source_conn.prepare("SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles")
+        .map_err(|e| format!("Failed to prepare select: {}", e))?;
+
+    let mut insert_stmt = dest_conn.prepare(
+        "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?1, ?2, ?3, ?4)"
+    ).map_err(|e| format!("Failed to prepare insert: {}", e))?;
+
+    let mut rows = stmt.query([]).map_err(|e| format!("Failed to query tiles: {}", e))?;
+    let mut count = 0;
+
+    while let Some(row) = rows.next().map_err(|e| format!("Failed to get row: {}", e))? {
+        let zoom: i32 = row.get(0).map_err(|e| format!("Failed to get zoom: {}", e))?;
+        let col: i32 = row.get(1).map_err(|e| format!("Failed to get col: {}", e))?;
+        let row_num: i32 = row.get(2).map_err(|e| format!("Failed to get row: {}", e))?;
+        let data: Vec<u8> = row.get(3).map_err(|e| format!("Failed to get data: {}", e))?;
+
+        insert_stmt.execute(rusqlite::params![zoom, col, row_num, data])
+            .map_err(|e| format!("Failed to insert tile: {}", e))?;
+        count += 1;
+    }
+
+    log::info!("Merged {} tiles from {} into {}", count,
+        source_path.file_name().unwrap_or_default().to_string_lossy(),
+        dest_path.file_name().unwrap_or_default().to_string_lossy());
+
+    Ok(())
+}
+
 /// Convert a BSB/KAP raster chart to MBTiles
 ///
 /// BSB/KAP charts use a color palette (typically 16-128 colors), which causes
@@ -368,6 +466,9 @@ pub fn write_mbtiles_metadata(mbtiles_path: &Path, name: &str, value: &str) -> R
 /// 2. Reproject to Web Mercator using gdalwarp
 /// 3. Convert to MBTiles using gdal_translate
 /// 4. Add overviews using gdaladdo
+///
+/// For antimeridian-crossing charts, we use a shifted projection to avoid
+/// the discontinuity at ±180°.
 pub fn convert_bsb_to_mbtiles(
     input_path: &Path,
     output_path: &Path,
@@ -383,6 +484,12 @@ pub fn convert_bsb_to_mbtiles(
 
     // Get chart bounds BEFORE conversion (from the source KAP file)
     let chart_bounds = get_chart_bounds(input_path);
+    let is_antimeridian = crosses_antimeridian(chart_bounds);
+
+    if is_antimeridian {
+        log::info!("Chart {} CROSSES ANTIMERIDIAN - using shifted projection",
+            input_path.file_name().unwrap_or_default().to_string_lossy());
+    }
 
     // Create temp file paths
     let temp_expanded = output_path.with_extension("expanded.tif");
@@ -411,8 +518,194 @@ pub fn convert_bsb_to_mbtiles(
     }
 
     // Step 2: Reproject to Web Mercator (EPSG:3857)
-    // Using multi-threading for faster processing while maintaining cubic quality
+    // For antimeridian charts, we use a SPLIT-AND-MERGE approach:
+    // 1. Split the chart at ±180° longitude into EAST and WEST halves
+    // 2. Convert each half to MBTiles separately
+    // 3. Merge the tiles into a single MBTiles file
     log::info!("Step 2: Reprojecting to Web Mercator (multi-threaded)");
+
+    if is_antimeridian {
+        // ANTIMERIDIAN CHART: Use split-and-merge approach
+        // This avoids the discontinuity at ±180° by processing each half separately
+        let bounds = chart_bounds.unwrap(); // We know it exists if is_antimeridian is true
+        let (min_lon, min_lat, max_lon, max_lat) = bounds;
+
+        // Bounds are normalized with max_lon > 180 for antimeridian charts
+        // e.g., (175.0, -29.69, 185.5, -15.10) means 175°E to 174.5°W
+        // EAST half: min_lon to 180 (positive side)
+        // WEST half: 180 to max_lon (which wraps to negative side: 180 - max_lon = actual negative lon)
+
+        log::info!("Antimeridian chart bounds: lon=[{}, {}], lat=[{}, {}]",
+            min_lon, max_lon, min_lat, max_lat);
+
+        // Calculate Web Mercator coordinates
+        const WEBMERC_HALF_WORLD: f64 = 20037508.342789244;
+
+        // EAST half bounds in Web Mercator (from min_lon to 180)
+        let east_min_x = lon_to_webmerc(min_lon);
+        let east_max_x = WEBMERC_HALF_WORLD; // 180° = max positive X
+
+        // WEST half bounds in Web Mercator (from -180 to the wrapped negative longitude)
+        // max_lon of 185.5 means actual longitude is 185.5 - 360 = -174.5
+        let west_actual_lon = max_lon - 360.0;
+        let west_min_x = -WEBMERC_HALF_WORLD; // -180° = min negative X
+        let west_max_x = lon_to_webmerc(west_actual_lon);
+
+        // Y bounds (same for both halves)
+        let min_y = lat_to_webmerc(min_lat);
+        let max_y = lat_to_webmerc(max_lat);
+
+        log::info!("EAST half Web Mercator: x=[{:.0}, {:.0}], y=[{:.0}, {:.0}]",
+            east_min_x, east_max_x, min_y, max_y);
+        log::info!("WEST half Web Mercator: x=[{:.0}, {:.0}], y=[{:.0}, {:.0}]",
+            west_min_x, west_max_x, min_y, max_y);
+
+        // Create temp files for each half
+        let temp_east_tif = output_path.with_extension("east.tif");
+        let temp_west_tif = output_path.with_extension("west.tif");
+        let temp_east_mbtiles = output_path.with_extension("east.mbtiles");
+        let temp_west_mbtiles = output_path.with_extension("west.mbtiles");
+
+        // Step 2a: Split and reproject EAST half
+        log::info!("Step 2a: Processing EAST half ({}° to 180°)", min_lon);
+        let east_warp = run_gdal_command(
+            "gdalwarp",
+            &[
+                "-t_srs", "EPSG:3857",
+                "-te", &format!("{}", east_min_x), &format!("{}", min_y),
+                       &format!("{}", east_max_x), &format!("{}", max_y),
+                "-r", "cubic",
+                "-multi",
+                "-wo", "NUM_THREADS=ALL_CPUS",
+                temp_expanded_str,
+                temp_east_tif.to_str().unwrap()
+            ]
+        )?;
+
+        if !east_warp.status.success() {
+            let _ = std::fs::remove_file(&temp_expanded);
+            let stderr = String::from_utf8_lossy(&east_warp.stderr);
+            return Err(ConversionError::ConversionFailed(
+                format!("Failed to process EAST half: {}", stderr)
+            ));
+        }
+
+        // Step 2b: Split and reproject WEST half
+        log::info!("Step 2b: Processing WEST half (-180° to {}°)", west_actual_lon);
+        let west_warp = run_gdal_command(
+            "gdalwarp",
+            &[
+                "-t_srs", "EPSG:3857",
+                "-te", &format!("{}", west_min_x), &format!("{}", min_y),
+                       &format!("{}", west_max_x), &format!("{}", max_y),
+                "-r", "cubic",
+                "-multi",
+                "-wo", "NUM_THREADS=ALL_CPUS",
+                temp_expanded_str,
+                temp_west_tif.to_str().unwrap()
+            ]
+        )?;
+
+        // Clean up expanded file
+        let _ = std::fs::remove_file(&temp_expanded);
+
+        if !west_warp.status.success() {
+            let _ = std::fs::remove_file(&temp_east_tif);
+            let stderr = String::from_utf8_lossy(&west_warp.stderr);
+            return Err(ConversionError::ConversionFailed(
+                format!("Failed to process WEST half: {}", stderr)
+            ));
+        }
+
+        // Step 3a: Convert EAST half to MBTiles
+        log::info!("Step 3a: Converting EAST half to MBTiles");
+        let east_translate = run_gdal_command(
+            "gdal_translate",
+            &[
+                "-of", "MBTiles",
+                "-co", "TILE_FORMAT=PNG",
+                temp_east_tif.to_str().unwrap(),
+                temp_east_mbtiles.to_str().unwrap()
+            ]
+        )?;
+
+        let _ = std::fs::remove_file(&temp_east_tif);
+
+        if !east_translate.status.success() {
+            let _ = std::fs::remove_file(&temp_west_tif);
+            let stderr = String::from_utf8_lossy(&east_translate.stderr);
+            return Err(ConversionError::ConversionFailed(
+                format!("Failed to create EAST MBTiles: {}", stderr)
+            ));
+        }
+
+        // Step 3b: Convert WEST half to MBTiles
+        log::info!("Step 3b: Converting WEST half to MBTiles");
+        let west_translate = run_gdal_command(
+            "gdal_translate",
+            &[
+                "-of", "MBTiles",
+                "-co", "TILE_FORMAT=PNG",
+                temp_west_tif.to_str().unwrap(),
+                temp_west_mbtiles.to_str().unwrap()
+            ]
+        )?;
+
+        let _ = std::fs::remove_file(&temp_west_tif);
+
+        if !west_translate.status.success() {
+            let _ = std::fs::remove_file(&temp_east_mbtiles);
+            let stderr = String::from_utf8_lossy(&west_translate.stderr);
+            return Err(ConversionError::ConversionFailed(
+                format!("Failed to create WEST MBTiles: {}", stderr)
+            ));
+        }
+
+        // Step 4a: Build overviews for EAST half
+        log::info!("Step 4a: Building overviews for EAST half");
+        let _ = run_gdal_command(
+            "gdaladdo",
+            &["-r", "nearest", temp_east_mbtiles.to_str().unwrap(), "2", "4", "8", "16"]
+        );
+
+        // Step 4b: Build overviews for WEST half
+        log::info!("Step 4b: Building overviews for WEST half");
+        let _ = run_gdal_command(
+            "gdaladdo",
+            &["-r", "nearest", temp_west_mbtiles.to_str().unwrap(), "2", "4", "8", "16"]
+        );
+
+        // Step 5: Merge the two MBTiles files
+        log::info!("Step 5: Merging EAST and WEST halves");
+
+        // Copy EAST as the base (or rename)
+        std::fs::copy(&temp_east_mbtiles, output_path)
+            .map_err(|e| ConversionError::IoError(e))?;
+
+        // Merge WEST tiles into the output
+        if let Err(e) = merge_mbtiles(output_path, &temp_west_mbtiles) {
+            let _ = std::fs::remove_file(output_path);
+            let _ = std::fs::remove_file(&temp_east_mbtiles);
+            let _ = std::fs::remove_file(&temp_west_mbtiles);
+            return Err(ConversionError::ConversionFailed(
+                format!("Failed to merge MBTiles: {}", e)
+            ));
+        }
+
+        // Clean up temp MBTiles
+        let _ = std::fs::remove_file(&temp_east_mbtiles);
+        let _ = std::fs::remove_file(&temp_west_mbtiles);
+
+        // Write correct bounds to metadata (using extended format: max_lon > 180)
+        if let Err(e) = write_mbtiles_bounds(output_path, bounds) {
+            log::warn!("Failed to write bounds to MBTiles: {}", e);
+        }
+
+        log::info!("Successfully converted antimeridian chart {} to MBTiles", input_str);
+        return Ok(output_path.to_path_buf());
+    }
+
+    // STANDARD CHART: Normal reprojection
     let warp_output = run_gdal_command(
         "gdalwarp",
         &[

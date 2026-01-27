@@ -206,8 +206,25 @@ function chartInfoToLayer(
   const boundsStr = chart.metadata.bounds;
 
   // Use custom values if set, otherwise fall back to original metadata
-  const effectiveMinZoom = customMeta?.customMinZoom ?? chart.metadata.minzoom ?? undefined;
-  const effectiveMaxZoom = customMeta?.customMaxZoom ?? chart.metadata.maxzoom ?? undefined;
+  // Convert null to undefined to ensure consistent handling
+  const metadataMinZoom = chart.metadata.minzoom ?? undefined;
+  const metadataMaxZoom = chart.metadata.maxzoom ?? undefined;
+  const effectiveMinZoom = customMeta?.customMinZoom ?? metadataMinZoom;
+  const effectiveMaxZoom = customMeta?.customMaxZoom ?? metadataMaxZoom;
+
+  const bounds = parseBounds(boundsStr);
+  const zoomBounds = parseBoundsForZoom(boundsStr);
+
+  // Diagnostic for antimeridian charts
+  if (!bounds && zoomBounds) {
+    console.info(`ChartLayer DIAG: ${chart.id} is antimeridian-crossing`, {
+      rawBounds: boundsStr,
+      bounds,
+      zoomBounds,
+      minZoom: effectiveMinZoom,
+      maxZoom: effectiveMaxZoom,
+    });
+  }
 
   return {
     id: chart.id,
@@ -218,8 +235,8 @@ function chartInfoToLayer(
     enabled: state?.enabled ?? true,
     opacity: state?.opacity ?? 1.0,
     zOrder: state?.zOrder ?? 0,
-    bounds: parseBounds(boundsStr), // For MapLibre source (undefined for antimeridian-crossing)
-    zoomBounds: parseBoundsForZoom(boundsStr), // For zoom-to functionality
+    bounds, // For MapLibre source (undefined for antimeridian-crossing)
+    zoomBounds, // For zoom-to functionality
     minZoom: effectiveMinZoom,
     maxZoom: effectiveMaxZoom,
     rawBoundsString: boundsStr ?? undefined,

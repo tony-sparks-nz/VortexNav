@@ -246,7 +246,7 @@ export function ChartBar({
       {visibleCharts.map((layer) => {
         const chartType = getChartType(layer);
         const displayName = getDisplayName(layer);
-        const isHighlighted = showChartOutlines && highlightedChartId === layer.chartId;
+        const isHighlighted = highlightedChartId === layer.chartId;
 
         const className = [
           'chart-bar__item',
@@ -260,8 +260,8 @@ export function ChartBar({
             key={layer.chartId}
             className={className}
             onClick={() => onToggleChart(layer.chartId)}
-            onMouseEnter={() => showChartOutlines && onChartHover(layer.chartId)}
-            onMouseLeave={() => showChartOutlines && onChartHover(null)}
+            onMouseEnter={() => onChartHover(layer.chartId)}
+            onMouseLeave={() => onChartHover(null)}
             onContextMenu={(e) => {
               e.preventDefault();
               handleLongPress(layer.chartId, e);
