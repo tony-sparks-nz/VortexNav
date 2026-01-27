@@ -558,8 +558,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link 0.2.1",
 ]
 
@@ -5153,11 +5155,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vortexnav-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "env_logger",
  "futures",
  "log",
  "nmea",
  "num_cpus",
+ "png",
  "quick-xml 0.31.0",
  "reqwest 0.11.27",
  "rusqlite",

@@ -1,35 +1,28 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import type { ThemeMode, Position } from '../types';
+import type { useWaypointManager } from '../hooks/useWaypointManager';
 import {
-  createWaypoint,
-  updateWaypoint,
-  deleteWaypoint,
   isTauri,
   calculateDistance,
   calculateBearing,
   formatDistance,
   formatBearing,
-  type Waypoint,
 } from '../hooks/useTauri';
 
 type SortOption = 'name' | 'distance' | 'created';
 type SortDirection = 'asc' | 'desc';
 
+// Get the return type of useWaypointManager
+type WaypointManagerType = ReturnType<typeof useWaypointManager>;
+
 interface WaypointPanelProps {
   theme: ThemeMode;
-  waypoints: Waypoint[];
+  waypointManager: WaypointManagerType;
   vesselPosition: Position | null;
-  draggingWaypoint?: { id: number; lat: number; lon: number } | null;
-  activeWaypointId: number | null;
-  selectedWaypointId?: number | null;
-  onSelectionChange?: (id: number | null) => void;
-  onClose: () => void;
-  onWaypointSelect: (waypoint: Waypoint | null) => void;
-  onNavigateTo: (waypoint: Waypoint) => void;
-  onCenterOnWaypoint: (waypoint: Waypoint) => void;
-  onWaypointsChange: () => void;
   pendingWaypoint: { lat: number; lon: number } | null;
   onPendingWaypointClear: () => void;
+  onCenterOnWaypoint: (waypointId: number) => void;
+  onClose: () => void;
 }
 
 // Available waypoint symbols
@@ -46,78 +39,60 @@ const WAYPOINT_SYMBOLS = [
 
 export function WaypointPanel({
   theme,
-  waypoints,
+  waypointManager,
   vesselPosition,
-  draggingWaypoint,
-  activeWaypointId,
-  selectedWaypointId: externalSelectedId,
-  onSelectionChange,
-  onClose,
-  onWaypointSelect,
-  onNavigateTo,
-  onCenterOnWaypoint,
-  onWaypointsChange,
   pendingWaypoint,
   onPendingWaypointClear,
+  onCenterOnWaypoint,
+  onClose,
 }: WaypointPanelProps) {
-  const [internalSelectedId, setInternalSelectedId] = useState<number | null>(null);
+  // Destructure everything we need from the manager
+  const {
+    state,
+    selectedWaypoint,
+    isEditing,
+    isSaving,
+    startCreate,
+    startEdit,
+    updateForm,
+    saveWaypoint,
+    cancelEdit,
+    deleteWaypoint,
+    setSelectedWaypoint,
+    toggleActiveWaypoint,
+    toggleAllLabels,
+    toggleAllMarkers,
+    toggleWaypointHidden,
+  } = waypointManager;
 
-  // Use external selection if provided, otherwise use internal state
-  const selectedWaypointId = externalSelectedId !== undefined ? externalSelectedId : internalSelectedId;
-
-  const setSelectedWaypointId = (id: number | null) => {
-    setInternalSelectedId(id);
-    onSelectionChange?.(id);
-  };
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [editingWaypoint, setEditingWaypoint] = useState<Waypoint | null>(null);
+  const { waypoints, editState, activeWaypointId, showAllLabels, showAllMarkers } = state;
 
   // Search and sort state
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<SortOption>('distance');
   const [sortDir, setSortDir] = useState<SortDirection>('asc');
 
-  // Form state for create/edit
-  const [formName, setFormName] = useState('');
-  const [formLat, setFormLat] = useState('');
-  const [formLon, setFormLon] = useState('');
-  const [formDescription, setFormDescription] = useState('');
-  const [formSymbol, setFormSymbol] = useState('default');
-
-  // Sync external selection to internal state
-  useEffect(() => {
-    if (externalSelectedId !== undefined && externalSelectedId !== internalSelectedId) {
-      setInternalSelectedId(externalSelectedId);
-    }
-  }, [externalSelectedId, internalSelectedId]);
-
-  // Get selected waypoint object
-  const selectedWaypoint = useMemo(() => {
-    return waypoints.find((w) => w.id === selectedWaypointId) || null;
-  }, [waypoints, selectedWaypointId]);
-
-  // Handle pending waypoint from map click
+  // Handle pending waypoint from map right-click (create new)
   useEffect(() => {
     if (pendingWaypoint) {
-      setFormName('');
-      setFormLat(pendingWaypoint.lat.toFixed(6));
-      setFormLon(pendingWaypoint.lon.toFixed(6));
-      setFormDescription('');
-      setFormSymbol('default');
-      setEditingWaypoint(null);
-      setShowCreateForm(true);
+      startCreate(pendingWaypoint);
     }
-  }, [pendingWaypoint]);
+  }, [pendingWaypoint, startCreate]);
 
-  // Calculate distance for sorting
-  const getDistance = (waypoint: Waypoint): number => {
+  // Get distance calculation helper
+  const getDistance = useCallback((lat: number, lon: number): number => {
     if (!vesselPosition) return Infinity;
     return calculateDistance(
       vesselPosition.lat,
       vesselPosition.lon,
-      waypoint.lat,
-      waypoint.lon
+      lat,
+      lon
     );
+  }, [vesselPosition]);
+
+  const getSymbolIcon = (symbolId: string | null): string => {
+    const symbol = WAYPOINT_SYMBOLS.find((s) => s.id === symbolId);
+    return symbol?.icon || '📍';
   };
 
   // Filter and sort waypoints
@@ -143,7 +118,7 @@ export function WaypointPanel({
           comparison = a.name.localeCompare(b.name);
           break;
         case 'distance':
-          comparison = getDistance(a) - getDistance(b);
+          comparison = getDistance(a.lat, a.lon) - getDistance(b.lat, b.lon);
           break;
         case 'created':
           comparison = (a.created_at || '').localeCompare(b.created_at || '');
@@ -154,117 +129,22 @@ export function WaypointPanel({
     });
 
     return filtered;
-  }, [waypoints, searchQuery, sortBy, sortDir, vesselPosition?.lat, vesselPosition?.lon]);
+  }, [waypoints, searchQuery, sortBy, sortDir, getDistance]);
 
-  const resetForm = () => {
-    setFormName('');
-    setFormLat('');
-    setFormLon('');
-    setFormDescription('');
-    setFormSymbol('default');
-    setEditingWaypoint(null);
-    setShowCreateForm(false);
-    onPendingWaypointClear();
-  };
-
-  const handleCreate = async () => {
-    const lat = parseFloat(formLat);
-    const lon = parseFloat(formLon);
-
-    if (!formName.trim() || isNaN(lat) || isNaN(lon)) {
-      return;
-    }
-
-    try {
-      await createWaypoint({
-        name: formName.trim(),
-        lat,
-        lon,
-        description: formDescription.trim() || null,
-        symbol: formSymbol,
-      });
-      onWaypointsChange();
-      resetForm();
-    } catch (error) {
-      console.error('Failed to create waypoint:', error);
-    }
-  };
-
-  const handleUpdate = async () => {
-    if (!editingWaypoint?.id) return;
-
-    const lat = parseFloat(formLat);
-    const lon = parseFloat(formLon);
-
-    if (!formName.trim() || isNaN(lat) || isNaN(lon)) {
-      return;
-    }
-
-    try {
-      await updateWaypoint({
-        ...editingWaypoint,
-        name: formName.trim(),
-        lat,
-        lon,
-        description: formDescription.trim() || null,
-        symbol: formSymbol,
-      });
-      onWaypointsChange();
-      resetForm();
-    } catch (error) {
-      console.error('Failed to update waypoint:', error);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!selectedWaypoint?.id) return;
-    if (!confirm(`Delete "${selectedWaypoint.name}"?`)) return;
-
-    try {
-      await deleteWaypoint(selectedWaypoint.id);
-      if (activeWaypointId === selectedWaypoint.id) {
-        onWaypointSelect(null);
-      }
-      setSelectedWaypointId(null);
-      onWaypointsChange();
-    } catch (error) {
-      console.error('Failed to delete waypoint:', error);
-    }
-  };
-
-  const startEdit = () => {
-    if (!selectedWaypoint) return;
-    setEditingWaypoint(selectedWaypoint);
-    setFormName(selectedWaypoint.name);
-    setFormLat(selectedWaypoint.lat.toFixed(6));
-    setFormLon(selectedWaypoint.lon.toFixed(6));
-    setFormDescription(selectedWaypoint.description || '');
-    setFormSymbol(selectedWaypoint.symbol || 'default');
-    setShowCreateForm(true);
-  };
-
-  const startCreate = () => {
-    resetForm();
-    setShowCreateForm(true);
-  };
-
-  const getSymbolIcon = (symbolId: string | null): string => {
-    const symbol = WAYPOINT_SYMBOLS.find((s) => s.id === symbolId);
-    return symbol?.icon || '📍';
-  };
-
-  // Pre-compute navigation data for all waypoints - updates when vessel, waypoints, or drag position changes
+  // Pre-compute navigation data for all waypoints
   const waypointNavData = useMemo(() => {
     const navMap = new Map<number, { distance: string; bearing: string }>();
 
     if (!vesselPosition) return navMap;
 
+    // Use dragging position if waypoint is being dragged
+    const dragging = state.dragging;
+
     for (const waypoint of waypoints) {
       if (waypoint.id === null) continue;
 
-      // Use dragging position if this waypoint is being dragged
-      const wpLat = draggingWaypoint?.id === waypoint.id ? draggingWaypoint.lat : waypoint.lat;
-      const wpLon = draggingWaypoint?.id === waypoint.id ? draggingWaypoint.lon : waypoint.lon;
+      const wpLat = dragging?.id === waypoint.id ? dragging.lat : waypoint.lat;
+      const wpLon = dragging?.id === waypoint.id ? dragging.lon : waypoint.lon;
 
       const distance = calculateDistance(
         vesselPosition.lat,
@@ -286,12 +166,11 @@ export function WaypointPanel({
     }
 
     return navMap;
-  }, [vesselPosition?.lat, vesselPosition?.lon, waypoints, draggingWaypoint]);
+  }, [vesselPosition, waypoints, state.dragging]);
 
-  // Helper to get nav data for a waypoint
-  const getDistanceBearing = (waypoint: Waypoint) => {
-    if (waypoint.id === null) return null;
-    return waypointNavData.get(waypoint.id) || null;
+  const getDistanceBearing = (waypointId: number | null) => {
+    if (waypointId === null) return null;
+    return waypointNavData.get(waypointId) || null;
   };
 
   const toggleSort = (option: SortOption) => {
@@ -303,14 +182,53 @@ export function WaypointPanel({
     }
   };
 
-  const handleRowClick = (waypoint: Waypoint) => {
-    setSelectedWaypointId(waypoint.id);
+  const handleRowClick = (waypointId: number) => {
+    setSelectedWaypoint(waypointId);
   };
 
-  const handleRowDoubleClick = (waypoint: Waypoint) => {
-    onCenterOnWaypoint(waypoint);
+  const handleRowDoubleClick = (waypointId: number) => {
+    onCenterOnWaypoint(waypointId);
   };
 
+  const handleSave = async () => {
+    await saveWaypoint();
+    onPendingWaypointClear();
+  };
+
+  const handleCancel = () => {
+    cancelEdit();
+    onPendingWaypointClear();
+  };
+
+  const handleDelete = async () => {
+    if (!selectedWaypoint?.id) return;
+    if (!confirm(`Delete "${selectedWaypoint.name}"?`)) return;
+    await deleteWaypoint(selectedWaypoint.id);
+  };
+
+  const handleStartEdit = () => {
+    if (selectedWaypoint?.id) {
+      startEdit(selectedWaypoint.id);
+    }
+  };
+
+  const handleStartCreate = () => {
+    startCreate();
+  };
+
+  const handleNavigateTo = () => {
+    if (selectedWaypoint?.id) {
+      toggleActiveWaypoint(selectedWaypoint.id);
+    }
+  };
+
+  const handleCenterOn = () => {
+    if (selectedWaypoint?.id) {
+      onCenterOnWaypoint(selectedWaypoint.id);
+    }
+  };
+
+  // Don't render in browser mode
   if (!isTauri()) {
     return (
       <div className={`waypoint-panel waypoint-panel--${theme}`}>
@@ -327,6 +245,10 @@ export function WaypointPanel({
     );
   }
 
+  const showForm = isEditing || editState.status === 'creating';
+  const formData = editState.formData;
+  const isCreating = editState.status === 'creating';
+
   return (
     <div className={`waypoint-panel waypoint-panel--${theme}`}>
       <div className="waypoint-panel__header">
@@ -336,16 +258,25 @@ export function WaypointPanel({
 
       <div className="waypoint-panel__content">
         {/* Create/Edit Form */}
-        {showCreateForm ? (
+        {showForm && formData ? (
           <div className="waypoint-panel__form">
-            <h3>{editingWaypoint ? 'Edit Waypoint' : 'New Waypoint'}</h3>
+            <button
+              className="waypoint-panel__form-back"
+              onClick={handleCancel}
+              title="Back to list"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+              <span>{isCreating ? 'New Waypoint' : 'Edit Waypoint'}</span>
+            </button>
 
             <div className="waypoint-panel__form-group">
               <label>Name</label>
               <input
                 type="text"
-                value={formName}
-                onChange={(e) => setFormName(e.target.value)}
+                value={formData.name}
+                onChange={(e) => updateForm({ name: e.target.value })}
                 placeholder="Waypoint name"
                 autoFocus
               />
@@ -356,8 +287,8 @@ export function WaypointPanel({
                 <label>Latitude</label>
                 <input
                   type="text"
-                  value={formLat}
-                  onChange={(e) => setFormLat(e.target.value)}
+                  value={formData.lat}
+                  onChange={(e) => updateForm({ lat: e.target.value })}
                   placeholder="37.8044"
                 />
               </div>
@@ -365,8 +296,8 @@ export function WaypointPanel({
                 <label>Longitude</label>
                 <input
                   type="text"
-                  value={formLon}
-                  onChange={(e) => setFormLon(e.target.value)}
+                  value={formData.lon}
+                  onChange={(e) => updateForm({ lon: e.target.value })}
                   placeholder="-122.4194"
                 />
               </div>
@@ -378,8 +309,8 @@ export function WaypointPanel({
                 {WAYPOINT_SYMBOLS.map((symbol) => (
                   <button
                     key={symbol.id}
-                    className={`waypoint-panel__symbol-btn ${formSymbol === symbol.id ? 'active' : ''}`}
-                    onClick={() => setFormSymbol(symbol.id)}
+                    className={`waypoint-panel__symbol-btn ${formData.symbol === symbol.id ? 'active' : ''}`}
+                    onClick={() => updateForm({ symbol: symbol.id })}
                     title={symbol.label}
                   >
                     {symbol.icon}
@@ -391,23 +322,42 @@ export function WaypointPanel({
             <div className="waypoint-panel__form-group">
               <label>Description (optional)</label>
               <textarea
-                value={formDescription}
-                onChange={(e) => setFormDescription(e.target.value)}
+                value={formData.description}
+                onChange={(e) => updateForm({ description: e.target.value })}
                 placeholder="Notes about this waypoint..."
                 rows={2}
               />
             </div>
 
+            <div className="waypoint-panel__form-group waypoint-panel__form-group--checkbox">
+              <label className="waypoint-panel__checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={formData.showLabel}
+                  onChange={(e) => updateForm({ showLabel: e.target.checked })}
+                />
+                <span>Show label on map</span>
+              </label>
+            </div>
+
+            {editState.error && (
+              <div className="waypoint-panel__error">{editState.error}</div>
+            )}
+
             <div className="waypoint-panel__form-actions">
-              <button className="waypoint-panel__btn waypoint-panel__btn--secondary" onClick={resetForm}>
+              <button
+                className="waypoint-panel__btn waypoint-panel__btn--secondary"
+                onClick={handleCancel}
+                disabled={isSaving}
+              >
                 Cancel
               </button>
               <button
                 className="waypoint-panel__btn waypoint-panel__btn--primary"
-                onClick={editingWaypoint ? handleUpdate : handleCreate}
-                disabled={!formName.trim() || !formLat || !formLon}
+                onClick={handleSave}
+                disabled={!formData.name.trim() || !formData.lat || !formData.lon || isSaving}
               >
-                {editingWaypoint ? 'Save' : 'Create'}
+                {isSaving ? 'Saving...' : 'Save'}
               </button>
             </div>
           </div>
@@ -435,7 +385,7 @@ export function WaypointPanel({
             <div className="waypoint-panel__actions">
               <button
                 className="waypoint-panel__action-btn waypoint-panel__action-btn--primary"
-                onClick={startCreate}
+                onClick={handleStartCreate}
                 title="Add new waypoint"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -447,7 +397,7 @@ export function WaypointPanel({
               <div className="waypoint-panel__action-divider" />
               <button
                 className="waypoint-panel__action-btn"
-                onClick={() => selectedWaypoint && onCenterOnWaypoint(selectedWaypoint)}
+                onClick={handleCenterOn}
                 disabled={!selectedWaypoint}
                 title="Show on map"
               >
@@ -458,7 +408,7 @@ export function WaypointPanel({
               </button>
               <button
                 className={`waypoint-panel__action-btn ${selectedWaypoint && activeWaypointId === selectedWaypoint.id ? 'active' : ''}`}
-                onClick={() => selectedWaypoint && onNavigateTo(selectedWaypoint)}
+                onClick={handleNavigateTo}
                 disabled={!selectedWaypoint}
                 title="Navigate to"
               >
@@ -468,7 +418,7 @@ export function WaypointPanel({
               </button>
               <button
                 className="waypoint-panel__action-btn"
-                onClick={startEdit}
+                onClick={handleStartEdit}
                 disabled={!selectedWaypoint}
                 title="Edit"
               >
@@ -486,6 +436,42 @@ export function WaypointPanel({
                   <polyline points="3 6 5 6 21 6" />
                   <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
                 </svg>
+              </button>
+              <div className="waypoint-panel__action-divider" />
+              <button
+                className={`waypoint-panel__action-btn ${showAllLabels ? 'active' : ''}`}
+                onClick={toggleAllLabels}
+                title={showAllLabels ? 'Hide all labels' : 'Show all labels'}
+              >
+                {showAllLabels ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                )}
+              </button>
+              <button
+                className={`waypoint-panel__action-btn ${showAllMarkers ? 'active' : ''}`}
+                onClick={toggleAllMarkers}
+                title={showAllMarkers ? 'Hide all markers' : 'Show all markers'}
+              >
+                {showAllMarkers ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+                    <circle cx="12" cy="10" r="3" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" opacity="0.4" />
+                    <circle cx="12" cy="10" r="3" opacity="0.4" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                )}
               </button>
             </div>
 
@@ -519,21 +505,25 @@ export function WaypointPanel({
             ) : (
               <div className="waypoint-panel__list">
                 {filteredWaypoints.map((waypoint) => {
-                  const nav = getDistanceBearing(waypoint);
-                  const isSelected = selectedWaypointId === waypoint.id;
+                  const nav = getDistanceBearing(waypoint.id);
+                  const isSelected = state.selectedWaypointId === waypoint.id;
                   const isNavigating = activeWaypointId === waypoint.id;
+                  const isHidden = waypoint.hidden;
 
                   return (
                     <div
                       key={waypoint.id}
-                      className={`waypoint-panel__row ${isSelected ? 'waypoint-panel__row--selected' : ''} ${isNavigating ? 'waypoint-panel__row--navigating' : ''}`}
-                      onClick={() => handleRowClick(waypoint)}
-                      onDoubleClick={() => handleRowDoubleClick(waypoint)}
+                      className={`waypoint-panel__row ${isSelected ? 'waypoint-panel__row--selected' : ''} ${isNavigating ? 'waypoint-panel__row--navigating' : ''} ${isHidden ? 'waypoint-panel__row--hidden' : ''}`}
+                      onClick={() => waypoint.id && handleRowClick(waypoint.id)}
+                      onDoubleClick={() => waypoint.id && handleRowDoubleClick(waypoint.id)}
                     >
-                      <span className="waypoint-panel__row-icon">
+                      <span className={`waypoint-panel__row-icon ${isHidden ? 'waypoint-panel__row-icon--hidden' : ''}`}>
                         {getSymbolIcon(waypoint.symbol)}
                       </span>
-                      <span className="waypoint-panel__row-name">{waypoint.name}</span>
+                      <span className={`waypoint-panel__row-name ${isHidden ? 'waypoint-panel__row-name--hidden' : ''}`}>{waypoint.name}</span>
+                      <span className={`waypoint-panel__row-desc ${isHidden ? 'waypoint-panel__row-desc--hidden' : ''}`} title={waypoint.description || ''}>
+                        {waypoint.description || ''}
+                      </span>
                       {nav && (
                         <>
                           <span className="waypoint-panel__row-dist">{nav.distance}</span>
@@ -547,6 +537,26 @@ export function WaypointPanel({
                           </svg>
                         </span>
                       )}
+                      <button
+                        className="waypoint-panel__row-hide-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (waypoint.id) toggleWaypointHidden(waypoint.id);
+                        }}
+                        title={isHidden ? 'Show on map' : 'Hide from map'}
+                      >
+                        {isHidden ? (
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                            <line x1="1" y1="1" x2="23" y2="23" />
+                          </svg>
+                        ) : (
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        )}
+                      </button>
                     </div>
                   );
                 })}

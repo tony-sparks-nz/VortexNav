@@ -1,9 +1,63 @@
 import { useState, useCallback, useMemo } from 'react';
-import type { BasemapProvider, ApiKeys, ThemeMode, ChartLayer } from '../types';
-import { BASEMAP_OPTIONS } from '../types';
+import type { BasemapProvider, ApiKeys, ThemeMode, ChartLayer, GebcoSettings, GebcoStatus, NauticalChartSettings, NauticalChartStatus, FolderImportResult } from '../types';
+import { BASEMAP_OPTIONS, CONTOUR_INTERVALS, DEFAULT_NAUTICAL_SETTINGS } from '../types';
 import { ChartLayerItem } from './ChartLayerItem';
+import { ChartEditModal } from './ChartEditModal';
 import { CatalogManager } from './CatalogManager';
+import { ChartImportDialog } from './ChartImportDialog';
+import { useCatalogs } from '../hooks/useCatalogs';
 
+// ============ LayerGroup Component ============
+interface LayerGroupProps {
+  title: string;
+  badge?: string;
+  enabled?: boolean;
+  onToggle?: (enabled: boolean) => void;
+  opacity?: number;
+  defaultExpanded?: boolean;
+  children: React.ReactNode;
+}
+
+function LayerGroup({
+  title,
+  badge,
+  enabled,
+  onToggle,
+  opacity,
+  defaultExpanded = false,
+  children,
+}: LayerGroupProps) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  return (
+    <div className={`layer-group ${expanded ? 'layer-group--expanded' : ''}`}>
+      <div className="layer-group__header" onClick={() => setExpanded(!expanded)}>
+        <span className="layer-group__chevron">{expanded ? '▼' : '▶'}</span>
+        <span className="layer-group__title">{title}</span>
+        {badge && <span className="layer-group__badge">{badge}</span>}
+        <div className="layer-group__controls" onClick={e => e.stopPropagation()}>
+          {opacity !== undefined && enabled && (
+            <span className="layer-group__opacity">{Math.round(opacity * 100)}%</span>
+          )}
+          {onToggle && (
+            <button
+              className={`layer-group__toggle ${enabled ? 'active' : ''}`}
+              onClick={() => onToggle(!enabled)}
+              title={enabled ? 'Disable layer' : 'Enable layer'}
+            />
+          )}
+        </div>
+      </div>
+      {expanded && (
+        <div className="layer-group__content">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============ LayerSwitcher Props ============
 interface LayerSwitcherProps {
   theme: ThemeMode;
   currentBasemap: BasemapProvider;
@@ -11,6 +65,15 @@ interface LayerSwitcherProps {
   apiKeys: ApiKeys;
   chartLayers: ChartLayer[];
   chartLayersLoading: boolean;
+  // GEBCO bathymetry
+  gebcoSettings?: GebcoSettings;
+  gebcoStatus?: GebcoStatus;
+  // Nautical Chart (consolidated CM93)
+  nauticalSettings?: NauticalChartSettings;
+  nauticalStatus?: NauticalChartStatus;
+  onGebcoSettingsChange?: (settings: GebcoSettings) => void;
+  onNauticalSettingsChange?: (settings: NauticalChartSettings) => void;
+  onNauticalInitialize?: (path: string) => void;
   onBasemapChange: (basemap: BasemapProvider) => void;
   onOpenSeaMapToggle: (show: boolean) => void;
   onApiKeysChange: (keys: ApiKeys) => void;
@@ -20,10 +83,17 @@ interface LayerSwitcherProps {
   onToggleChart: (chartId: string) => void;
   onChartOpacity: (chartId: string, opacity: number) => void;
   onZoomToChart: (chartId: string) => void;
+  onUpdateChartMetadata?: (chartId: string, metadata: {
+    customName: string | null;
+    customDescription: string | null;
+    customMinZoom: number | null;
+    customMaxZoom: number | null;
+  }) => void;
   onRefreshCharts: () => void;
   onClose: () => void;
 }
 
+// ============ Main Component ============
 export function LayerSwitcher({
   theme,
   currentBasemap,
@@ -31,6 +101,13 @@ export function LayerSwitcher({
   apiKeys,
   chartLayers,
   chartLayersLoading,
+  gebcoSettings,
+  gebcoStatus,
+  nauticalSettings = DEFAULT_NAUTICAL_SETTINGS,
+  nauticalStatus,
+  onGebcoSettingsChange,
+  onNauticalSettingsChange,
+  onNauticalInitialize,
   onBasemapChange,
   onOpenSeaMapToggle,
   onApiKeysChange,
@@ -40,15 +117,47 @@ export function LayerSwitcher({
   onToggleChart,
   onChartOpacity,
   onZoomToChart,
+  onUpdateChartMetadata,
   onRefreshCharts,
   onClose,
 }: LayerSwitcherProps) {
   const [showSettings, setShowSettings] = useState(false);
   const [tempEsriKey, setTempEsriKey] = useState(apiKeys.esri || '');
   const [showCatalogManager, setShowCatalogManager] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
   const [selectedForDeletion, setSelectedForDeletion] = useState<Set<string>>(new Set());
   const [selectedForOpacity, setSelectedForOpacity] = useState<string | null>(null);
   const [nameFilter, setNameFilter] = useState('');
+  const [chartToEdit, setChartToEdit] = useState<ChartLayer | null>(null);
+  const [nauticalPathInput, setNauticalPathInput] = useState(nauticalSettings?.dataPath ?? '');
+  const [folderImportResult, setFolderImportResult] = useState<{ message: string; isError: boolean } | null>(null);
+
+  // Hook for folder import functionality
+  const {
+    scanFolderForCharts,
+    importSelectedCharts,
+    gdalInfo,
+    importProgress,
+  } = useCatalogs();
+
+  // Handle folder import complete
+  const handleFolderImportComplete = useCallback((result: FolderImportResult) => {
+    if (result.converted > 0) {
+      setFolderImportResult({
+        message: `Successfully imported ${result.converted} chart(s)`,
+        isError: false,
+      });
+      onRefreshCharts();
+    } else if (result.failed > 0) {
+      setFolderImportResult({
+        message: `Import failed for ${result.failed} chart(s)`,
+        isError: true,
+      });
+    }
+    setShowImportDialog(false);
+    // Clear message after 5 seconds
+    setTimeout(() => setFolderImportResult(null), 5000);
+  }, [onRefreshCharts]);
 
   // Filter charts by name
   const filteredChartLayers = useMemo(() => {
@@ -64,6 +173,23 @@ export function LayerSwitcher({
   const selectedChart = selectedForOpacity
     ? chartLayers.find(l => l.chartId === selectedForOpacity)
     : null;
+
+  // Get current basemap name for badge
+  const currentBasemapName = useMemo(() => {
+    const opt = BASEMAP_OPTIONS.find(o => o.id === currentBasemap);
+    return opt?.name || currentBasemap;
+  }, [currentBasemap]);
+
+  // Check if bathymetry has any data available
+  const hasBathymetryData = gebcoStatus?.dem_available ||
+    gebcoStatus?.hillshade_available ||
+    gebcoStatus?.color_available ||
+    gebcoStatus?.contours_available;
+
+  // Check if any bathymetry feature is enabled
+  const isBathymetryEnabled = gebcoSettings?.show_hillshade ||
+    gebcoSettings?.show_color ||
+    gebcoSettings?.show_contours;
 
   // Toggle selection for a single chart
   const toggleChartSelection = useCallback((chartId: string) => {
@@ -84,19 +210,17 @@ export function LayerSwitcher({
     const allFilteredSelected = filteredChartLayers.every(l => selectedForDeletion.has(l.chartId));
 
     if (allFilteredSelected) {
-      // Deselect all filtered charts
       setSelectedForDeletion(prev => {
         const newSet = new Set(prev);
         filteredIds.forEach(id => newSet.delete(id));
         return newSet;
       });
     } else {
-      // Select all filtered charts
       setSelectedForDeletion(prev => new Set([...prev, ...filteredIds]));
     }
   }, [filteredChartLayers, selectedForDeletion]);
 
-  // Show all selected charts (make visible)
+  // Show all selected charts
   const showSelectedCharts = useCallback(() => {
     selectedForDeletion.forEach(chartId => {
       const layer = chartLayers.find(l => l.chartId === chartId);
@@ -106,7 +230,7 @@ export function LayerSwitcher({
     });
   }, [selectedForDeletion, chartLayers, onToggleChart]);
 
-  // Hide all selected charts (make invisible)
+  // Hide all selected charts
   const hideSelectedCharts = useCallback(() => {
     selectedForDeletion.forEach(chartId => {
       const layer = chartLayers.find(l => l.chartId === chartId);
@@ -129,7 +253,6 @@ export function LayerSwitcher({
     if (onRemoveMultipleCharts) {
       onRemoveMultipleCharts(Array.from(selectedForDeletion));
     } else {
-      // Fallback: delete one by one
       for (const chartId of selectedForDeletion) {
         onRemoveChart(chartId);
       }
@@ -142,9 +265,7 @@ export function LayerSwitcher({
   const someSelected = selectedForDeletion.size > 0;
 
   const handleSaveKeys = () => {
-    onApiKeysChange({
-      esri: tempEsriKey || undefined,
-    });
+    onApiKeysChange({ esri: tempEsriKey || undefined });
     setShowSettings(false);
   };
 
@@ -154,8 +275,10 @@ export function LayerSwitcher({
     return true;
   };
 
-  // Check if any basemap requires an API key (to show settings button)
   const hasApiKeyOptions = BASEMAP_OPTIONS.some(opt => opt.requiresApiKey);
+
+  // Count enabled offline charts
+  const enabledChartsCount = chartLayers.filter(l => l.enabled).length;
 
   return (
     <div className={`layer-panel layer-panel--${theme}`}>
@@ -165,23 +288,12 @@ export function LayerSwitcher({
       </div>
 
       <div className="layer-panel__content">
-        <div className="layer-panel__section">
-          <div className="layer-panel__section-header">
-            <h3>Basemap</h3>
-            {hasApiKeyOptions && (
-              <button
-                className="layer-panel__settings-btn"
-                onClick={() => setShowSettings(!showSettings)}
-                title="API Settings"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="3" />
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                </svg>
-              </button>
-            )}
-          </div>
-
+        {/* ============ BASEMAP GROUP ============ */}
+        <LayerGroup
+          title="Basemap"
+          badge={currentBasemapName}
+          defaultExpanded={false}
+        >
           {showSettings ? (
             <div className="layer-panel__settings">
               <div className="layer-panel__field">
@@ -193,13 +305,12 @@ export function LayerSwitcher({
                   placeholder="Enter Esri API key..."
                 />
                 <small>
-                  Required for Esri imagery. {' '}
+                  Required for Esri imagery.{' '}
                   <a href="https://developers.arcgis.com/sign-up/" target="_blank" rel="noopener noreferrer">
                     Get free API key
                   </a>
                 </small>
               </div>
-
               <button className="layer-panel__save-btn" onClick={handleSaveKeys}>
                 Save
               </button>
@@ -227,171 +338,389 @@ export function LayerSwitcher({
                 })}
               </div>
 
+              {hasApiKeyOptions && (
+                <button
+                  className="layer-panel__api-settings-link"
+                  onClick={() => setShowSettings(true)}
+                >
+                  Configure API Keys
+                </button>
+              )}
+
               <div className="layer-panel__overlays">
-                <h4>Overlays</h4>
                 <label className="overlay-toggle">
                   <input
                     type="checkbox"
                     checked={showOpenSeaMap}
                     onChange={(e) => onOpenSeaMapToggle(e.target.checked)}
                   />
-                  <span>OpenSeaMap (nautical features)</span>
+                  <span>OpenSeaMap overlay</span>
                 </label>
               </div>
             </>
           )}
-        </div>
+        </LayerGroup>
 
-        {/* Chart Catalogs Section */}
-        <div className="layer-panel__section layer-panel__catalogs">
-          <div className="layer-panel__section-header">
-            <h3>Chart Catalogs</h3>
-            <button
-              className="layer-panel__add-btn"
-              onClick={() => setShowCatalogManager(!showCatalogManager)}
-              title={showCatalogManager ? "Hide catalog manager" : "Show catalog manager"}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                {showCatalogManager ? (
-                  <path d="M18 15l-6-6-6 6" />
-                ) : (
-                  <path d="M6 9l6 6 6-6" />
-                )}
-              </svg>
-            </button>
-          </div>
+        {/* ============ NAUTICAL CHART GROUP ============ */}
+        <LayerGroup
+          title="Nautical Chart"
+          enabled={nauticalStatus?.initialized && nauticalSettings?.enabled}
+          onToggle={nauticalStatus?.initialized ? (enabled) => {
+            onNauticalSettingsChange?.({ ...nauticalSettings!, enabled });
+          } : undefined}
+          opacity={nauticalSettings?.opacity}
+          defaultExpanded={false}
+        >
+          {!nauticalStatus?.initialized ? (
+            <div className="layer-group__unavailable">
+              <p>Nautical chart data not loaded.</p>
+              <div className="layer-group__path-input">
+                <input
+                  type="text"
+                  placeholder="Enter chart data folder path..."
+                  value={nauticalPathInput}
+                  onChange={(e) => setNauticalPathInput(e.target.value)}
+                />
+                <button
+                  className="layer-group__load-btn"
+                  onClick={() => {
+                    if (nauticalPathInput.trim()) {
+                      onNauticalInitialize?.(nauticalPathInput.trim());
+                    }
+                  }}
+                  disabled={!nauticalPathInput.trim()}
+                >
+                  Load
+                </button>
+              </div>
+              <small>Point to your nautical chart database folder</small>
+            </div>
+          ) : (
+            <>
+              <div className="layer-group__status">
+                <small>Scales: {nauticalStatus.availableScales.join(', ') || 'None'}</small>
+              </div>
 
-          {showCatalogManager && (
-            <CatalogManager
-              theme={theme}
-              onChartReady={() => {
-                onRefreshCharts();
-              }}
-            />
+              {nauticalSettings?.enabled && (
+                <>
+                  <div className="feature-grid">
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showSoundings}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showSoundings: e.target.checked })
+                        }
+                      />
+                      <span>Soundings</span>
+                    </label>
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showDepthContours}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showDepthContours: e.target.checked })
+                        }
+                      />
+                      <span>Contours</span>
+                    </label>
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showLights}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showLights: e.target.checked })
+                        }
+                      />
+                      <span>Lights</span>
+                    </label>
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showBuoys}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showBuoys: e.target.checked })
+                        }
+                      />
+                      <span>Buoys</span>
+                    </label>
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showLand}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showLand: e.target.checked })
+                        }
+                      />
+                      <span>Land</span>
+                    </label>
+                    <label className="feature-toggle">
+                      <input
+                        type="checkbox"
+                        checked={nauticalSettings.showObstructions}
+                        onChange={(e) =>
+                          onNauticalSettingsChange?.({ ...nauticalSettings, showObstructions: e.target.checked })
+                        }
+                      />
+                      <span>Hazards</span>
+                    </label>
+                  </div>
+
+                  <div className="layer-group__slider">
+                    <label>Opacity</label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={nauticalSettings.opacity}
+                      onChange={(e) =>
+                        onNauticalSettingsChange?.({ ...nauticalSettings, opacity: parseFloat(e.target.value) })
+                      }
+                    />
+                    <span>{Math.round(nauticalSettings.opacity * 100)}%</span>
+                  </div>
+                </>
+              )}
+            </>
           )}
-        </div>
+        </LayerGroup>
 
-        {/* Offline Charts Section */}
-        <div className="layer-panel__section layer-panel__charts">
-          <div className="layer-panel__section-header">
-            <h3>Offline Charts ({chartLayers.length})</h3>
+        {/* ============ BATHYMETRY GROUP ============ */}
+        <LayerGroup
+          title="Bathymetry"
+          enabled={isBathymetryEnabled}
+          onToggle={hasBathymetryData ? (enabled) => {
+            // Toggle all bathymetry features
+            onGebcoSettingsChange?.({
+              ...gebcoSettings!,
+              show_hillshade: enabled && (gebcoStatus?.dem_available || gebcoStatus?.hillshade_available || false),
+              show_color: enabled && (gebcoStatus?.color_available || false),
+              show_contours: false, // Keep contours off by default
+            });
+          } : undefined}
+          defaultExpanded={false}
+        >
+          {!hasBathymetryData ? (
+            <div className="layer-group__unavailable">
+              <p>Bathymetry data not installed.</p>
+              <small>
+                Place GEBCO MBTiles files in the charts folder:
+                <br />• _gebco_color.mbtiles (depth colors)
+                <br />• _gebco_hillshade.mbtiles (shaded relief)
+                <br />• _gebco_contours.mbtiles (contour lines)
+              </small>
+            </div>
+          ) : (
+            <>
+              {/* Hillshade */}
+              {(gebcoStatus?.dem_available || gebcoStatus?.hillshade_available) && (
+                <div className="layer-group__control">
+                  <label className="feature-toggle">
+                    <input
+                      type="checkbox"
+                      checked={gebcoSettings?.show_hillshade ?? false}
+                      onChange={(e) =>
+                        onGebcoSettingsChange?.({ ...gebcoSettings!, show_hillshade: e.target.checked })
+                      }
+                    />
+                    <span>Hillshade (relief)</span>
+                  </label>
+                  {gebcoSettings?.show_hillshade && (
+                    <div className="layer-group__inline-slider">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={gebcoSettings?.hillshade_opacity ?? 0.3}
+                        onChange={(e) =>
+                          onGebcoSettingsChange?.({ ...gebcoSettings!, hillshade_opacity: parseFloat(e.target.value) })
+                        }
+                      />
+                      <span>{Math.round((gebcoSettings?.hillshade_opacity ?? 0.3) * 100)}%</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Depth Colors */}
+              {gebcoStatus?.color_available && (
+                <div className="layer-group__control">
+                  <label className="feature-toggle">
+                    <input
+                      type="checkbox"
+                      checked={gebcoSettings?.show_color ?? false}
+                      onChange={(e) =>
+                        onGebcoSettingsChange?.({ ...gebcoSettings!, show_color: e.target.checked })
+                      }
+                    />
+                    <span>Depth colors</span>
+                  </label>
+                  {gebcoSettings?.show_color && (
+                    <div className="layer-group__inline-slider">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={gebcoSettings?.color_opacity ?? 0.5}
+                        onChange={(e) =>
+                          onGebcoSettingsChange?.({ ...gebcoSettings!, color_opacity: parseFloat(e.target.value) })
+                        }
+                      />
+                      <span>{Math.round((gebcoSettings?.color_opacity ?? 0.5) * 100)}%</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Contours */}
+              {gebcoStatus?.contours_available && (
+                <div className="layer-group__control">
+                  <label className="feature-toggle">
+                    <input
+                      type="checkbox"
+                      checked={gebcoSettings?.show_contours ?? false}
+                      onChange={(e) =>
+                        onGebcoSettingsChange?.({ ...gebcoSettings!, show_contours: e.target.checked })
+                      }
+                    />
+                    <span>Depth contours</span>
+                  </label>
+                  {gebcoSettings?.show_contours && (
+                    <div className="layer-group__interval">
+                      <select
+                        value={gebcoSettings?.contour_interval ?? 100}
+                        onChange={(e) =>
+                          onGebcoSettingsChange?.({ ...gebcoSettings!, contour_interval: parseInt(e.target.value, 10) })
+                        }
+                      >
+                        {CONTOUR_INTERVALS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </LayerGroup>
+
+        {/* ============ OFFLINE CHARTS GROUP ============ */}
+        <LayerGroup
+          title="Offline Charts"
+          badge={chartLayers.length > 0 ? `(${enabledChartsCount}/${chartLayers.length})` : undefined}
+          defaultExpanded={false}
+        >
+          <div className="layer-group__charts-header">
             <button
-              className="layer-panel__add-btn"
+              className="layer-group__add-btn"
               onClick={onAddChart}
               title="Import MBTiles chart"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 5v14M5 12h14" />
-              </svg>
+              + Add Chart
+            </button>
+            <button
+              className="layer-group__add-btn layer-group__add-btn--folder"
+              onClick={() => setShowImportDialog(true)}
+              disabled={!gdalInfo?.available}
+              title={gdalInfo?.available ? "Import charts from folder (BSB, KAP files)" : "GDAL required for folder import"}
+            >
+              + Import Folder
+            </button>
+            <button
+              className="layer-group__catalog-btn"
+              onClick={() => setShowCatalogManager(!showCatalogManager)}
+            >
+              {showCatalogManager ? 'Hide Catalogs' : 'Chart Catalogs'}
             </button>
           </div>
 
+          {/* Folder import result message */}
+          {folderImportResult && (
+            <div className={`layer-group__import-result ${folderImportResult.isError ? 'layer-group__import-result--error' : 'layer-group__import-result--success'}`}>
+              {folderImportResult.message}
+            </div>
+          )}
+
+          {showCatalogManager && (
+            <div className="layer-group__catalog-manager">
+              <CatalogManager theme={theme} onChartReady={onRefreshCharts} />
+            </div>
+          )}
+
           {chartLayersLoading ? (
-            <div className="layer-panel__loading">Loading charts...</div>
+            <div className="layer-group__loading">Loading charts...</div>
           ) : chartLayers.length === 0 ? (
-            <div className="layer-panel__empty">
-              No charts loaded. Click + to import MBTiles files.
+            <div className="layer-group__empty">
+              No charts loaded. Click "Add Chart" to import MBTiles files.
             </div>
           ) : (
             <>
               {/* Name filter */}
-              <div className="layer-panel__filter">
+              <div className="layer-group__filter">
                 <input
                   type="text"
-                  className="layer-panel__filter-input"
                   placeholder="Filter by name..."
                   value={nameFilter}
                   onChange={(e) => setNameFilter(e.target.value)}
                 />
                 {nameFilter && (
-                  <button
-                    className="layer-panel__filter-clear"
-                    onClick={() => setNameFilter('')}
-                    title="Clear filter"
-                  >
-                    ×
-                  </button>
-                )}
-                {nameFilter && (
-                  <span className="layer-panel__filter-count">
-                    {filteredChartLayers.length}/{chartLayers.length}
-                  </span>
+                  <>
+                    <button className="layer-group__filter-clear" onClick={() => setNameFilter('')}>×</button>
+                    <span className="layer-group__filter-count">{filteredChartLayers.length}/{chartLayers.length}</span>
+                  </>
                 )}
               </div>
 
-              {/* Bulk actions toolbar */}
-              <div className="layer-panel__bulk-actions">
-                <label className="layer-panel__select-all">
+              {/* Bulk actions */}
+              <div className="layer-group__bulk-actions">
+                <label className="layer-group__select-all">
                   <input
                     type="checkbox"
                     checked={allFilteredSelected}
                     onChange={toggleSelectAll}
                   />
-                  <span>Select All</span>
+                  <span>All</span>
                 </label>
                 {someSelected && (
                   <>
-                    <button
-                      className="layer-panel__visibility-btn layer-panel__visibility-btn--show"
-                      onClick={showSelectedCharts}
-                      title="Show selected charts"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                        <circle cx="12" cy="12" r="3" />
-                      </svg>
+                    <button className="layer-group__action-btn" onClick={showSelectedCharts} title="Show selected">
                       Show
                     </button>
-                    <button
-                      className="layer-panel__visibility-btn layer-panel__visibility-btn--hide"
-                      onClick={hideSelectedCharts}
-                      title="Hide selected charts"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
-                        <line x1="1" y1="1" x2="23" y2="23" />
-                      </svg>
+                    <button className="layer-group__action-btn" onClick={hideSelectedCharts} title="Hide selected">
                       Hide
                     </button>
-                    <button
-                      className="layer-panel__delete-btn"
-                      onClick={deleteSelectedCharts}
-                      title={`Delete ${selectedForDeletion.size} selected chart(s)`}
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
-                      </svg>
+                    <button className="layer-group__action-btn layer-group__action-btn--danger" onClick={deleteSelectedCharts}>
                       Delete ({selectedForDeletion.size})
                     </button>
                   </>
                 )}
               </div>
 
-              {/* Global opacity slider */}
+              {/* Selected chart opacity */}
               {selectedChart && (
-                <div className="layer-panel__global-opacity">
-                  <span className="layer-panel__global-opacity-label">
-                    Opacity: {selectedChart.name}
-                  </span>
+                <div className="layer-group__selected-opacity">
+                  <span>{selectedChart.name}</span>
                   <input
                     type="range"
-                    className="layer-panel__global-opacity-slider"
                     min="0"
                     max="1"
                     step="0.05"
                     value={selectedChart.opacity}
                     onChange={(e) => onChartOpacity(selectedChart.chartId, parseFloat(e.target.value))}
                   />
-                  <span className="layer-panel__global-opacity-value">
-                    {Math.round(selectedChart.opacity * 100)}%
-                  </span>
+                  <span>{Math.round(selectedChart.opacity * 100)}%</span>
                 </div>
               )}
 
-              <div className="layer-panel__chart-list">
+              {/* Chart list */}
+              <div className="layer-group__chart-list">
                 {filteredChartLayers.map((layer) => (
-                  <div key={layer.id} className="layer-panel__chart-item-wrapper">
-                    <label className="layer-panel__chart-checkbox">
+                  <div key={layer.id} className="layer-group__chart-item">
+                    <label className="layer-group__chart-checkbox">
                       <input
                         type="checkbox"
                         checked={selectedForDeletion.has(layer.chartId)}
@@ -408,21 +737,44 @@ export function LayerSwitcher({
                       )}
                       onZoomTo={() => onZoomToChart(layer.chartId)}
                       onRemove={() => onRemoveChart(layer.chartId)}
+                      onEdit={onUpdateChartMetadata ? () => setChartToEdit(layer) : undefined}
                     />
                   </div>
                 ))}
               </div>
 
-              {/* Show message when filter has no results */}
               {filteredChartLayers.length === 0 && nameFilter && (
-                <div className="layer-panel__empty">
-                  No charts match "{nameFilter}"
-                </div>
+                <div className="layer-group__empty">No charts match "{nameFilter}"</div>
               )}
             </>
           )}
-        </div>
+        </LayerGroup>
       </div>
+
+      {/* Chart Import Dialog for folder import */}
+      {showImportDialog && (
+        <ChartImportDialog
+          theme={theme}
+          onClose={() => setShowImportDialog(false)}
+          onScanFolder={scanFolderForCharts}
+          onImportSelected={importSelectedCharts}
+          importProgress={importProgress}
+          onImportComplete={handleFolderImportComplete}
+        />
+      )}
+
+      {/* Chart Edit Modal */}
+      {chartToEdit && onUpdateChartMetadata && (
+        <ChartEditModal
+          chart={chartToEdit}
+          theme={theme}
+          onSave={(chartId, metadata) => {
+            onUpdateChartMetadata(chartId, metadata);
+            setChartToEdit(null);
+          }}
+          onClose={() => setChartToEdit(null)}
+        />
+      )}
     </div>
   );
 }

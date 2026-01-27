@@ -1,11 +1,69 @@
 import { useEffect, useRef, useState } from 'react';
 import maplibregl, { LngLatBounds } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel, ChartLayer } from '../types';
-import type { Waypoint } from '../hooks/useTauri';
+import type { ThemeMode, Position, BasemapProvider, ApiKeys, Vessel, ChartLayer, WaypointDraggingState, GebcoSettings, GebcoStatus, Cm93Status, Cm93Settings, GeoJsonTile, RouteWithWaypoints, TempWaypoint, TrackWithPoints } from '../types';
+import {
+  calculateBearing,
+  calculateDistance,
+  formatBearing,
+  formatDistance,
+  type Waypoint,
+} from '../hooks/useTauri';
 import { registerMBTilesProtocol } from '../utils/mbtilesProtocol';
 
 export type { LngLatBounds };
+
+/**
+ * Convert tile coordinates to Bing Maps quadkey format
+ * Bing uses a quadkey system where each zoom level adds a digit (0-3)
+ */
+function tileToQuadkey(x: number, y: number, z: number): string {
+  let quadkey = '';
+  for (let i = z; i > 0; i--) {
+    let digit = 0;
+    const mask = 1 << (i - 1);
+    if ((x & mask) !== 0) digit += 1;
+    if ((y & mask) !== 0) digit += 2;
+    quadkey += digit.toString();
+  }
+  return quadkey;
+}
+
+// Track if Bing protocol is registered
+let bingProtocolRegistered = false;
+
+/**
+ * Register custom protocol for Bing satellite tiles
+ * Converts bing://{z}/{x}/{y} to actual Bing quadkey URLs
+ */
+function registerBingProtocol() {
+  if (bingProtocolRegistered) return;
+
+  maplibregl.addProtocol('bing', async (params) => {
+    // Parse z/x/y from URL: bing://{z}/{x}/{y}
+    const match = params.url.match(/bing:\/\/(\d+)\/(\d+)\/(\d+)/);
+    if (!match) {
+      throw new Error('Invalid Bing tile URL');
+    }
+
+    const z = parseInt(match[1], 10);
+    const x = parseInt(match[2], 10);
+    const y = parseInt(match[3], 10);
+    const quadkey = tileToQuadkey(x, y, z);
+    const subdomain = ['t0', 't1', 't2', 't3'][(x + y) % 4];
+    const url = `https://ecn.${subdomain}.tiles.virtualearth.net/tiles/a${quadkey}.jpeg?g=14237`;
+
+    // Fetch the tile
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.arrayBuffer();
+    return { data };
+  });
+
+  bingProtocolRegistered = true;
+}
 
 interface ContextMenuState {
   visible: boolean;
@@ -19,7 +77,7 @@ interface WaypointContextMenuState {
   visible: boolean;
   x: number;
   y: number;
-  waypoint: Waypoint | null;
+  waypointId: number | null;
 }
 
 interface MapViewProps {
@@ -32,20 +90,55 @@ interface MapViewProps {
   vessel?: Vessel;
   waypoints?: Waypoint[];
   activeWaypointId?: number | null;
+  editingWaypointId?: number | null;
+  showAllLabels?: boolean;
+  showAllMarkers?: boolean;
+  editingPreview?: { id: number; name: string; symbol: string; description: string } | null;
+  draggingWaypoint?: WaypointDraggingState | null;
   pendingWaypoint?: { lat: number; lon: number } | null;
   orientationMode?: 'north-up' | 'heading-up';
   chartLayers?: ChartLayer[];
+  allChartsHidden?: boolean;  // Global toggle to hide all chart layers
+  showChartOutlines?: boolean;  // Show chart boundary outlines on map
+  highlightedChartId?: string | null;  // Chart to highlight (for outline mode)
+  onChartToggle?: (chartId: string) => void;  // Toggle chart visibility from map button
+  // GEBCO bathymetry
+  gebcoSettings?: GebcoSettings;
+  gebcoStatus?: GebcoStatus;
+  // Nautical chart (internal CM93 format)
+  cm93Settings?: Cm93Settings;
+  cm93Status?: Cm93Status;
+  onCm93FeaturesRequest?: (minLat: number, minLon: number, maxLat: number, maxLon: number, zoom: number) => Promise<GeoJsonTile | null>;
   onOrientationModeChange?: (mode: 'north-up' | 'heading-up') => void;
   onMapReady?: (map: maplibregl.Map) => void;
   onMapRightClick?: (lat: number, lon: number) => void;
-  onWaypointClick?: (waypoint: Waypoint) => void;
-  onWaypointDragEnd?: (waypoint: Waypoint, newLat: number, newLon: number) => void;
-  onWaypointDrag?: (waypoint: Waypoint, lat: number, lon: number) => void;
-  onWaypointDelete?: (waypoint: Waypoint) => void;
+  onWaypointClick?: (waypointId: number) => void;
+  onWaypointDragStart?: (waypointId: number, lat: number, lon: number) => void;
+  onWaypointDrag?: (waypointId: number, lat: number, lon: number) => void;
+  onWaypointDragEnd?: (waypointId: number, newLat: number, newLon: number) => void;
+  onWaypointDelete?: (waypointId: number) => void;
+  onWaypointEdit?: (waypointId: number) => void;
+  onWaypointNavigate?: (waypointId: number) => void;
+  onWaypointToggleHidden?: (waypointId: number) => void;
   onQuickWaypointCreate?: (lat: number, lon: number) => void;
+  onStartRouteCreation?: (lat: number, lon: number) => void;
   onCursorMove?: (lat: number, lon: number) => void;
   onCursorLeave?: () => void;
   onBoundsChange?: (bounds: LngLatBounds, zoom: number) => void;
+  // Route display
+  routes?: RouteWithWaypoints[];
+  activeRouteId?: number | null;
+  selectedRouteId?: number | null;  // Route being viewed/edited in panel
+  // Route creation mode
+  routeCreationModeActive?: boolean;
+  routeCreationWaypoints?: TempWaypoint[];
+  onRouteCreationClick?: (lat: number, lon: number) => void;
+  onRouteClick?: (routeId: number) => void;
+  // Current waypoint index for active route navigation
+  currentRouteWaypointIndex?: number;
+  // Track display
+  tracks?: TrackWithPoints[];
+  recordingTrackId?: number | null;
 }
 
 // Waypoint symbol icons mapping
@@ -60,10 +153,19 @@ const WAYPOINT_SYMBOL_ICONS: Record<string, string> = {
   beach: '🏖️',
 };
 
+// Generate a hash of waypoint data that affects marker appearance
+// When this hash changes, the marker needs to be recreated
+function getWaypointHash(wp: Waypoint, showAllLabels: boolean, showAllMarkers: boolean, isActive: boolean): string {
+  // Include visibility factors in hash so marker is recreated when visibility changes
+  const isVisible = (showAllMarkers || isActive) && (!wp.hidden || isActive);
+  return `${wp.id}-${wp.name}-${wp.symbol || 'default'}-${wp.description || ''}-${wp.show_label}-${showAllLabels}-${wp.hidden}-${showAllMarkers}-${isVisible}`;
+}
+
 // Create waypoint marker element
 function createWaypointMarkerElement(
   waypoint: Waypoint,
-  isActive: boolean
+  isActive: boolean,
+  showLabel: boolean
 ): HTMLDivElement {
   const container = document.createElement('div');
   container.className = `waypoint-marker ${isActive ? 'waypoint-marker--active' : ''}`;
@@ -71,9 +173,19 @@ function createWaypointMarkerElement(
 
   const icon = WAYPOINT_SYMBOL_ICONS[waypoint.symbol || 'default'] || '📍';
 
+  // Set tooltip with description if available
+  if (waypoint.description) {
+    container.title = waypoint.description;
+  }
+
+  // Only show label if both global toggle is on AND waypoint's individual show_label is true
+  const labelHtml = showLabel
+    ? `<div class="waypoint-marker__label">${waypoint.name}</div>`
+    : '';
+
   container.innerHTML = `
     <div class="waypoint-marker__icon">${icon}</div>
-    <div class="waypoint-marker__label">${waypoint.name}</div>
+    ${labelHtml}
   `;
 
   return container;
@@ -133,6 +245,10 @@ function buildMapStyle(
 
   // Add basemap source and layer based on provider
   switch (basemap) {
+    case 'none':
+      // No basemap - useful for seeing only chart layers
+      break;
+
     case 'osm':
       sources['basemap'] = {
         type: 'raster',
@@ -216,16 +332,93 @@ function buildMapStyle(
         };
       }
       break;
+
+    case 'sentinel-2':
+      sources['basemap'] = {
+        type: 'raster',
+        tiles: [
+          'https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg'
+        ],
+        tileSize: 256,
+        maxzoom: 14,
+        attribution: '&copy; <a href="https://s2maps.eu">Sentinel-2 cloudless</a> by EOX - Contains modified Copernicus Sentinel data 2021',
+      };
+      break;
+
+    case 'bing-satellite':
+      // Bing uses quadkey format - custom protocol handles conversion
+      registerBingProtocol();
+      sources['basemap'] = {
+        type: 'raster',
+        tiles: [
+          'bing://{z}/{x}/{y}'
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: '&copy; Microsoft Bing Maps',
+      };
+      break;
+
+    case 'mapbox-satellite':
+      if (apiKeys.mapbox) {
+        sources['basemap'] = {
+          type: 'raster',
+          tiles: [
+            `https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg90?access_token=${apiKeys.mapbox}`
+          ],
+          tileSize: 512,
+          maxzoom: 22,
+          attribution: '&copy; <a href="https://www.mapbox.com/">Mapbox</a>',
+        };
+      } else {
+        // Fallback to OSM if no API key
+        sources['basemap'] = {
+          type: 'raster',
+          tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+          tileSize: 256,
+          maxzoom: 19,
+          attribution: '&copy; OpenStreetMap (Mapbox API key required for satellite)',
+        };
+      }
+      break;
+
+    case 'here-satellite':
+      if (apiKeys.here) {
+        sources['basemap'] = {
+          type: 'raster',
+          tiles: [
+            `https://1.aerial.maps.ls.hereapi.com/maptile/2.1/maptile/newest/satellite.day/{z}/{x}/{y}/256/jpg?apiKey=${apiKeys.here}`,
+            `https://2.aerial.maps.ls.hereapi.com/maptile/2.1/maptile/newest/satellite.day/{z}/{x}/{y}/256/jpg?apiKey=${apiKeys.here}`,
+            `https://3.aerial.maps.ls.hereapi.com/maptile/2.1/maptile/newest/satellite.day/{z}/{x}/{y}/256/jpg?apiKey=${apiKeys.here}`,
+            `https://4.aerial.maps.ls.hereapi.com/maptile/2.1/maptile/newest/satellite.day/{z}/{x}/{y}/256/jpg?apiKey=${apiKeys.here}`,
+          ],
+          tileSize: 256,
+          maxzoom: 20,
+          attribution: '&copy; HERE',
+        };
+      } else {
+        // Fallback to OSM if no API key
+        sources['basemap'] = {
+          type: 'raster',
+          tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+          tileSize: 256,
+          maxzoom: 19,
+          attribution: '&copy; OpenStreetMap (HERE API key required for satellite)',
+        };
+      }
+      break;
   }
 
-  // Add basemap layer
-  layers.push({
-    id: 'basemap-layer',
-    type: 'raster',
-    source: 'basemap',
-    minzoom: 0,
-    maxzoom: 22,
-  });
+  // Add basemap layer (only if not 'none')
+  if (basemap !== 'none') {
+    layers.push({
+      id: 'basemap-layer',
+      type: 'raster',
+      source: 'basemap',
+      minzoom: 0,
+      maxzoom: 22,
+    });
+  }
 
   // Add OpenSeaMap overlay if enabled
   if (showOpenSeaMap) {
@@ -267,20 +460,51 @@ export function MapView({
   vessel,
   waypoints = [],
   activeWaypointId,
+  editingWaypointId: _editingWaypointId,
+  editingPreview,
+  draggingWaypoint: _draggingWaypoint,
   pendingWaypoint,
   orientationMode = 'north-up',
   chartLayers = [],
+  allChartsHidden = false,
+  showChartOutlines = false,
+  highlightedChartId = null,
+  onChartToggle,
+  gebcoSettings,
+  gebcoStatus,
+  cm93Settings,
+  cm93Status,
+  onCm93FeaturesRequest,
+  showAllLabels = true,
+  showAllMarkers = true,
   onOrientationModeChange,
   onMapReady,
   onMapRightClick,
   onWaypointClick,
-  onWaypointDragEnd,
+  onWaypointDragStart,
   onWaypointDrag,
+  onWaypointDragEnd,
   onWaypointDelete,
+  onWaypointEdit,
+  onWaypointNavigate,
+  onWaypointToggleHidden,
   onQuickWaypointCreate,
+  onStartRouteCreation,
   onCursorMove,
   onCursorLeave,
   onBoundsChange,
+  // Route props
+  routes = [],
+  activeRouteId,
+  selectedRouteId,
+  routeCreationModeActive = false,
+  routeCreationWaypoints = [],
+  onRouteCreationClick,
+  onRouteClick: _onRouteClick,
+  currentRouteWaypointIndex = 0,
+  // Track props
+  tracks = [],
+  recordingTrackId,
 }: MapViewProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -288,6 +512,7 @@ export function MapView({
   const waypointMarkersRef = useRef<Map<number, maplibregl.Marker>>(new Map());
   const pendingMarkerRef = useRef<maplibregl.Marker | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+  const [is3DMode, setIs3DMode] = useState(false);
   // Track style version to re-add chart layers after style changes
   const [styleVersion, setStyleVersion] = useState(0);
 
@@ -305,32 +530,49 @@ export function MapView({
     visible: false,
     x: 0,
     y: 0,
-    waypoint: null,
+    waypointId: null,
   });
 
-  // Track which waypoint is being dragged
-  const draggingWaypointRef = useRef<Waypoint | null>(null);
+  // Track waypoint being dragged for real-time route updates
+  const [draggingWaypointState, setDraggingWaypointState] = useState<{
+    id: number;
+    lat: number;
+    lon: number;
+  } | null>(null);
 
-  // Store callbacks in refs to avoid map reinitialization
+  // Track marker hashes to detect when data changes and marker needs recreation
+  const markerHashesRef = useRef<Map<number, string>>(new Map());
+
+  // Store callbacks in refs to avoid stale closures and map reinitialization
   const onCursorMoveRef = useRef(onCursorMove);
   const onCursorLeaveRef = useRef(onCursorLeave);
   const onMapRightClickRef = useRef(onMapRightClick);
+  const onWaypointDragStartRef = useRef(onWaypointDragStart);
+  const onWaypointDragRef = useRef(onWaypointDrag);
   const onWaypointDragEndRef = useRef(onWaypointDragEnd);
   const onQuickWaypointCreateRef = useRef(onQuickWaypointCreate);
+  const onStartRouteCreationRef = useRef(onStartRouteCreation);
   const onWaypointClickRef = useRef(onWaypointClick);
   const onWaypointDeleteRef = useRef(onWaypointDelete);
-  const onWaypointDragRef = useRef(onWaypointDrag);
+  const onWaypointEditRef = useRef(onWaypointEdit);
+  const onWaypointNavigateRef = useRef(onWaypointNavigate);
   const onOrientationModeChangeRef = useRef(onOrientationModeChange);
   const onBoundsChangeRef = useRef(onBoundsChange);
+
+  // Update refs on every render
   onCursorMoveRef.current = onCursorMove;
   onCursorLeaveRef.current = onCursorLeave;
   onBoundsChangeRef.current = onBoundsChange;
   onMapRightClickRef.current = onMapRightClick;
+  onWaypointDragStartRef.current = onWaypointDragStart;
+  onWaypointDragRef.current = onWaypointDrag;
   onWaypointDragEndRef.current = onWaypointDragEnd;
   onQuickWaypointCreateRef.current = onQuickWaypointCreate;
+  onStartRouteCreationRef.current = onStartRouteCreation;
   onWaypointClickRef.current = onWaypointClick;
   onWaypointDeleteRef.current = onWaypointDelete;
-  onWaypointDragRef.current = onWaypointDrag;
+  onWaypointEditRef.current = onWaypointEdit;
+  onWaypointNavigateRef.current = onWaypointNavigate;
   onOrientationModeChangeRef.current = onOrientationModeChange;
 
   // Initialize map
@@ -535,8 +777,8 @@ export function MapView({
       return;
     }
 
-    // Verify basemap layer exists - if not, the style may have been corrupted
-    if (!map.getLayer('basemap-layer')) {
+    // Verify basemap layer exists - if not, and basemap isn't 'none', the style may have been corrupted
+    if (basemap !== 'none' && !map.getLayer('basemap-layer')) {
       console.warn('MapView: Basemap layer missing! Style may need to be rebuilt.');
       return;
     }
@@ -561,7 +803,8 @@ export function MapView({
         return;
       }
 
-      if (layer.enabled) {
+      // Only show layer if it's enabled AND global charts are not hidden
+      if (layer.enabled && !allChartsHidden) {
         newLayerIds.add(layer.chartId);
 
         try {
@@ -573,12 +816,15 @@ export function MapView({
               maxZoom: layer.maxZoom,
               bounds: layer.bounds
             });
+            // Extend zoom range by 2 levels to allow for overzooming/underzooming
+            const extendedMinZoom = Math.max(0, (layer.minZoom ?? 0) - 2);
+            const extendedMaxZoom = Math.min(22, (layer.maxZoom ?? 22) + 2);
             map.addSource(sourceId, {
               type: 'raster',
               tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
               tileSize: 256,
-              minzoom: layer.minZoom ?? 0,
-              maxzoom: layer.maxZoom ?? 22,
+              minzoom: extendedMinZoom,
+              maxzoom: extendedMaxZoom,
               // Set bounds to limit tile requests to the chart's coverage area
               bounds: layer.bounds,
             });
@@ -596,12 +842,21 @@ export function MapView({
 
             console.debug(`MapView: Adding layer ${layerId}`, {
               beforeLayerId,
-              opacity: layer.opacity
+              opacity: layer.opacity,
+              minZoom: layer.minZoom,
+              maxZoom: layer.maxZoom
             });
+            // Use same extended zoom range as source
+            const layerMinZoom = Math.max(0, (layer.minZoom ?? 0) - 2);
+            const layerMaxZoom = Math.min(22, (layer.maxZoom ?? 22) + 2);
             map.addLayer({
               id: layerId,
               type: 'raster',
               source: sourceId,
+              // Set layer zoom constraints to match source - this controls visibility
+              // Extended by 2 levels to allow over/underzooming
+              minzoom: layerMinZoom,
+              maxzoom: layerMaxZoom,
               paint: {
                 'raster-opacity': layer.opacity,
               },
@@ -651,7 +906,1309 @@ export function MapView({
         map.setLayoutProperty('basemap-layer', 'visibility', 'visible');
       }
     }
-  }, [chartLayers, mapLoaded, styleVersion]);
+  }, [chartLayers, mapLoaded, styleVersion, allChartsHidden]);
+
+  // ============ Chart Outlines Layer ============
+  // Shows boundaries of all chart layers as rectangles when enabled
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const OUTLINE_SOURCE = 'chart-outlines';
+    const OUTLINE_LABELS_SOURCE = 'chart-outline-labels';
+    const OUTLINE_LAYER = 'chart-outlines-layer';
+    const OUTLINE_HIGHLIGHT_LAYER = 'chart-outlines-highlight-layer';
+    const OUTLINE_FILL_LAYER = 'chart-outlines-fill-layer';
+    const OUTLINE_LABELS_LAYER = 'chart-outline-labels-layer';
+    const OUTLINE_BUTTONS_SOURCE = 'chart-outline-buttons';
+    const OUTLINE_BUTTONS_LAYER = 'chart-outline-buttons-layer';
+    const OUTLINE_BUTTONS_GLOW_LAYER = 'chart-outline-buttons-glow-layer';
+
+    // Remove existing layers and sources first
+    if (map.getLayer(OUTLINE_BUTTONS_LAYER)) {
+      map.removeLayer(OUTLINE_BUTTONS_LAYER);
+    }
+    if (map.getLayer(OUTLINE_BUTTONS_GLOW_LAYER)) {
+      map.removeLayer(OUTLINE_BUTTONS_GLOW_LAYER);
+    }
+    if (map.getLayer(OUTLINE_LABELS_LAYER)) {
+      map.removeLayer(OUTLINE_LABELS_LAYER);
+    }
+    if (map.getLayer(OUTLINE_HIGHLIGHT_LAYER)) {
+      map.removeLayer(OUTLINE_HIGHLIGHT_LAYER);
+    }
+    if (map.getLayer(OUTLINE_LAYER)) {
+      map.removeLayer(OUTLINE_LAYER);
+    }
+    if (map.getLayer(OUTLINE_FILL_LAYER)) {
+      map.removeLayer(OUTLINE_FILL_LAYER);
+    }
+    if (map.getSource(OUTLINE_BUTTONS_SOURCE)) {
+      map.removeSource(OUTLINE_BUTTONS_SOURCE);
+    }
+    if (map.getSource(OUTLINE_LABELS_SOURCE)) {
+      map.removeSource(OUTLINE_LABELS_SOURCE);
+    }
+    if (map.getSource(OUTLINE_SOURCE)) {
+      map.removeSource(OUTLINE_SOURCE);
+    }
+
+    // If outlines are disabled, we're done
+    if (!showChartOutlines) return;
+
+    /**
+     * Analyze bounds and determine how to handle them for rendering
+     *
+     * Antimeridian crossing patterns:
+     * Type A: minLon > 0 && maxLon < 0 (e.g., 175 to -175) - east to west crossing
+     * Type B: minLon < 0 && maxLon > 0 && span > 180 (e.g., -175 to 175) - west to east "long way"
+     *
+     * For Type B, the bounds mean: from minLon westward to -180, then from 180 eastward to maxLon
+     */
+    const analyzeBounds = (minLon: number, minLat: number, maxLon: number, maxLat: number): {
+      type: 'normal' | 'antimeridian-east-to-west' | 'antimeridian-west-to-east' | 'inverted';
+      west: number;
+      south: number;
+      east: number;
+      north: number;
+    } => {
+      const span = maxLon - minLon;
+
+      // Case 1: Antimeridian crossing Type A - minLon positive, maxLon negative
+      // Example: chart from 175°E to 175°W = minLon=175, maxLon=-175
+      // The chart crosses going EAST from 175 -> 180/-180 -> -175
+      if (minLon > 0 && maxLon < 0) {
+        return { type: 'antimeridian-east-to-west', west: minLon, south: minLat, east: maxLon, north: maxLat };
+      }
+
+      // Case 2: Antimeridian crossing Type B - minLon negative, maxLon positive, span > 180°
+      // Example: "-174.55,-30,175.53,-15" - mathematically 350° span but actually ~10° crossing antimeridian
+      // The chart crosses going WEST from minLon -> -180/180 -> maxLon
+      if (minLon < 0 && maxLon > 0 && span > 180) {
+        return { type: 'antimeridian-west-to-east', west: minLon, south: minLat, east: maxLon, north: maxLat };
+      }
+
+      // Case 3: Inverted bounds in same hemisphere - minLon > maxLon but same sign
+      // Example: "179,-40,170,-35" - both positive, just inverted data
+      if (minLon > maxLon) {
+        return { type: 'inverted', west: maxLon, south: minLat, east: minLon, north: maxLat };
+      }
+
+      // Case 4: Normal bounds
+      return { type: 'normal', west: minLon, south: minLat, east: maxLon, north: maxLat };
+    };
+
+    // Build GeoJSON features from chart bounds
+    const features: Array<{
+      type: 'Feature';
+      properties: { chartId: string; name: string; enabled: boolean; minZoom: number; maxZoom: number };
+      geometry: { type: 'Polygon'; coordinates: number[][][] };
+    }> = [];
+
+    // Label points for zoom level display (positioned at bottom-right of each chart)
+    const labelFeatures: Array<{
+      type: 'Feature';
+      properties: { chartId: string; zoomLabel: string; minZoom: number; maxZoom: number };
+      geometry: { type: 'Point'; coordinates: [number, number] };
+    }> = [];
+
+    // Toggle button points (positioned at top-right of each chart)
+    const buttonFeatures: Array<{
+      type: 'Feature';
+      properties: { chartId: string; enabled: boolean; minZoom: number; maxZoom: number };
+      geometry: { type: 'Point'; coordinates: [number, number] };
+    }> = [];
+
+    for (const layer of chartLayers) {
+      // Use rawBoundsString to get original bounds for outline rendering
+      const boundsStr = layer.rawBoundsString;
+      if (!boundsStr) continue;
+
+      const parts = boundsStr.split(',').map(Number);
+      if (parts.length !== 4 || parts.some(n => isNaN(n))) continue;
+
+      const [minLon, minLat, maxLon, maxLat] = parts;
+      const chartMinZoom = layer.minZoom ?? 0;
+      const chartMaxZoom = layer.maxZoom ?? 22;
+      // Extend zoom range by 2 levels for display (same as tile layers)
+      const extendedMinZoom = Math.max(0, chartMinZoom - 2);
+      const extendedMaxZoom = Math.min(22, chartMaxZoom + 2);
+      const props = {
+        chartId: layer.chartId,
+        name: layer.name,
+        enabled: layer.enabled,
+        minZoom: extendedMinZoom,  // Use extended range for outline visibility
+        maxZoom: extendedMaxZoom,
+      };
+
+      // Create label text with chart name and zoom range (e.g., "Chart Name z8–12")
+      const zoomLabel = `${layer.name} z${chartMinZoom}–${chartMaxZoom}`;
+
+      const analysis = analyzeBounds(minLon, minLat, maxLon, maxLat);
+
+      if (analysis.type === 'antimeridian-east-to-west') {
+        // Type A: Chart goes from positive lon (east) to negative lon (west)
+        // e.g., 175°E to 175°W - crosses going EAST through 180°
+        // Eastern polygon: from minLon (positive) to 180°
+        features.push({
+          type: 'Feature' as const,
+          properties: props,
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [[
+              [analysis.west, analysis.south],
+              [180, analysis.south],
+              [180, analysis.north],
+              [analysis.west, analysis.north],
+              [analysis.west, analysis.south],
+            ]],
+          },
+        });
+        // Western polygon: from -180° to maxLon (negative)
+        features.push({
+          type: 'Feature' as const,
+          properties: props,
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [[
+              [-180, analysis.south],
+              [analysis.east, analysis.south],
+              [analysis.east, analysis.north],
+              [-180, analysis.north],
+              [-180, analysis.south],
+            ]],
+          },
+        });
+        // Label at bottom-right of western polygon (the main visible part)
+        labelFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, zoomLabel, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.south],
+          },
+        });
+        // Toggle button at top-right of western polygon
+        buttonFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, enabled: layer.enabled, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.north],
+          },
+        });
+      } else if (analysis.type === 'antimeridian-west-to-east') {
+        // Type B: Chart goes from negative lon (west) to positive lon (east) the "long way"
+        // e.g., -175°W to 175°E - actually crosses going WEST through -180°/180°
+        // Western polygon: from minLon (negative) to -180°
+        features.push({
+          type: 'Feature' as const,
+          properties: props,
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [[
+              [analysis.west, analysis.south],
+              [-180, analysis.south],
+              [-180, analysis.north],
+              [analysis.west, analysis.north],
+              [analysis.west, analysis.south],
+            ]],
+          },
+        });
+        // Eastern polygon: from 180° to maxLon (positive)
+        features.push({
+          type: 'Feature' as const,
+          properties: props,
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [[
+              [180, analysis.south],
+              [analysis.east, analysis.south],
+              [analysis.east, analysis.north],
+              [180, analysis.north],
+              [180, analysis.south],
+            ]],
+          },
+        });
+        // Label at bottom-right of eastern polygon (the main visible part)
+        labelFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, zoomLabel, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.south],
+          },
+        });
+        // Toggle button at top-right of eastern polygon
+        buttonFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, enabled: layer.enabled, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.north],
+          },
+        });
+      } else {
+        // Normal or inverted (now corrected) - single polygon
+        features.push({
+          type: 'Feature' as const,
+          properties: props,
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [[
+              [analysis.west, analysis.south],
+              [analysis.east, analysis.south],
+              [analysis.east, analysis.north],
+              [analysis.west, analysis.north],
+              [analysis.west, analysis.south],
+            ]],
+          },
+        });
+        // Label at bottom-right corner (east, south)
+        labelFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, zoomLabel, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.south],
+          },
+        });
+        // Toggle button at top-right corner (east, north)
+        buttonFeatures.push({
+          type: 'Feature' as const,
+          properties: { chartId: layer.chartId, enabled: layer.enabled, minZoom: extendedMinZoom, maxZoom: extendedMaxZoom },
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [analysis.east, analysis.north],
+          },
+        });
+      }
+    }
+
+    if (features.length === 0) return;
+
+    // Add the source
+    map.addSource(OUTLINE_SOURCE, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features,
+      },
+    });
+
+    // Add semi-transparent fill for non-highlighted charts
+    // Only show when current zoom is within the chart's zoom range
+    map.addLayer({
+      id: OUTLINE_FILL_LAYER,
+      type: 'fill',
+      source: OUTLINE_SOURCE,
+      filter: [
+        'all',
+        ['<=', ['get', 'minZoom'], ['zoom']],
+        ['>=', ['get', 'maxZoom'], ['zoom']],
+      ],
+      paint: {
+        'fill-color': [
+          'case',
+          ['==', ['get', 'chartId'], highlightedChartId || ''],
+          'rgba(34, 197, 94, 0.15)', // Green fill for highlighted
+          'rgba(59, 130, 246, 0.08)', // Very light blue for others
+        ],
+        'fill-outline-color': 'transparent',
+      },
+    });
+
+    // Add outline layer for all charts (thin line)
+    // Only show when current zoom is within the chart's zoom range
+    map.addLayer({
+      id: OUTLINE_LAYER,
+      type: 'line',
+      source: OUTLINE_SOURCE,
+      filter: [
+        'all',
+        ['<=', ['get', 'minZoom'], ['zoom']],
+        ['>=', ['get', 'maxZoom'], ['zoom']],
+      ],
+      paint: {
+        'line-color': [
+          'case',
+          ['==', ['get', 'chartId'], highlightedChartId || ''],
+          '#22c55e', // Green for highlighted
+          '#3b82f6', // Blue for others
+        ],
+        'line-width': [
+          'case',
+          ['==', ['get', 'chartId'], highlightedChartId || ''],
+          3,
+          1.5,
+        ],
+        'line-opacity': [
+          'case',
+          ['==', ['get', 'chartId'], highlightedChartId || ''],
+          1,
+          0.6,
+        ],
+      },
+    });
+
+    // Add dashed highlight layer for the highlighted chart
+    // Only show when current zoom is within the chart's zoom range
+    if (highlightedChartId) {
+      map.addLayer({
+        id: OUTLINE_HIGHLIGHT_LAYER,
+        type: 'line',
+        source: OUTLINE_SOURCE,
+        filter: [
+          'all',
+          ['==', ['get', 'chartId'], highlightedChartId],
+          ['<=', ['get', 'minZoom'], ['zoom']],
+          ['>=', ['get', 'maxZoom'], ['zoom']],
+        ],
+        paint: {
+          'line-color': '#22c55e',
+          'line-width': 3,
+          'line-dasharray': [0, 0], // Solid line
+        },
+      });
+    }
+
+    // Add zoom level labels at bottom-right of each chart frame
+    if (labelFeatures.length > 0) {
+      map.addSource(OUTLINE_LABELS_SOURCE, {
+        type: 'geojson',
+        data: {
+          type: 'FeatureCollection',
+          features: labelFeatures,
+        },
+      });
+
+      map.addLayer({
+        id: OUTLINE_LABELS_LAYER,
+        type: 'symbol',
+        source: OUTLINE_LABELS_SOURCE,
+        // Only show when current zoom is within the chart's extended zoom range
+        filter: [
+          'all',
+          ['<=', ['get', 'minZoom'], ['zoom']],
+          ['>=', ['get', 'maxZoom'], ['zoom']],
+        ],
+        layout: {
+          'text-field': ['get', 'zoomLabel'],
+          'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
+          'text-size': 11,
+          'text-anchor': 'bottom-right',
+          'text-offset': [-0.5, -0.5], // Offset slightly inside the corner
+          'text-allow-overlap': true,  // Allow overlapping labels so all charts are labeled
+          'text-ignore-placement': true, // Don't hide based on collision
+          'text-padding': 2,
+          'text-max-width': 20, // Allow longer labels to wrap if needed
+        },
+        paint: {
+          'text-color': '#3b82f6', // Blue to match outline
+          'text-halo-color': 'rgba(255, 255, 255, 0.9)',
+          'text-halo-width': 1.5,
+          'text-halo-blur': 0.5,
+        },
+      });
+    }
+
+    // Add toggle buttons at top-right of each chart frame
+    if (buttonFeatures.length > 0) {
+      map.addSource(OUTLINE_BUTTONS_SOURCE, {
+        type: 'geojson',
+        data: {
+          type: 'FeatureCollection',
+          features: buttonFeatures,
+        },
+      });
+
+      // Glow layer (larger, blurred circle behind the button)
+      map.addLayer({
+        id: OUTLINE_BUTTONS_GLOW_LAYER,
+        type: 'circle',
+        source: OUTLINE_BUTTONS_SOURCE,
+        filter: [
+          'all',
+          ['<=', ['get', 'minZoom'], ['zoom']],
+          ['>=', ['get', 'maxZoom'], ['zoom']],
+        ],
+        paint: {
+          'circle-radius': 12,
+          'circle-color': [
+            'case',
+            ['get', 'enabled'],
+            'rgba(34, 197, 94, 0.4)', // Green glow when enabled
+            'rgba(59, 130, 246, 0.4)', // Blue glow when disabled
+          ],
+          'circle-blur': 0.8,
+        },
+      });
+
+      // Button layer (smaller, solid circle)
+      map.addLayer({
+        id: OUTLINE_BUTTONS_LAYER,
+        type: 'circle',
+        source: OUTLINE_BUTTONS_SOURCE,
+        filter: [
+          'all',
+          ['<=', ['get', 'minZoom'], ['zoom']],
+          ['>=', ['get', 'maxZoom'], ['zoom']],
+        ],
+        paint: {
+          'circle-radius': 6,
+          'circle-color': [
+            'case',
+            ['get', 'enabled'],
+            '#22c55e', // Green when enabled
+            '#3b82f6', // Blue when disabled
+          ],
+          'circle-stroke-width': 2,
+          'circle-stroke-color': 'rgba(255, 255, 255, 0.9)',
+        },
+      });
+
+      // Add click handler for toggle buttons
+      map.on('click', OUTLINE_BUTTONS_LAYER, (e) => {
+        if (e.features && e.features.length > 0) {
+          const chartId = e.features[0].properties?.chartId;
+          if (chartId && onChartToggle) {
+            onChartToggle(chartId);
+          }
+        }
+      });
+
+      // Change cursor on hover
+      map.on('mouseenter', OUTLINE_BUTTONS_LAYER, () => {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+      map.on('mouseleave', OUTLINE_BUTTONS_LAYER, () => {
+        map.getCanvas().style.cursor = '';
+      });
+    }
+  }, [chartLayers, mapLoaded, showChartOutlines, highlightedChartId, onChartToggle]);
+
+  // ============ Nautical Chart Vector Layer ============
+  // Renders vector nautical chart data with S52-style symbology
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+    if (!cm93Status?.initialized || !cm93Settings?.enabled || !onCm93FeaturesRequest) return;
+
+    const NAUTICAL_SOURCE = 'nautical-vector';
+
+    // Define layer IDs for different feature types
+    const NAUTICAL_LAYERS = {
+      land: 'nautical-land',
+      coastline: 'nautical-coastline',
+      depthAreas: 'nautical-depth-areas',
+      depthContours: 'nautical-depth-contours',
+      soundings: 'nautical-soundings',
+      lights: 'nautical-lights',
+      buoys: 'nautical-buoys',
+      obstructions: 'nautical-obstructions',
+      shoreline: 'nautical-shoreline',
+      intertidal: 'nautical-intertidal',
+      trafficSeparation: 'nautical-traffic-separation',
+      anchorage: 'nautical-anchorage',
+      cautionArea: 'nautical-caution-area',
+    };
+
+    let isCancelled = false;
+
+    console.log('Nautical: Effect running', {
+      initialized: cm93Status?.initialized,
+      enabled: cm93Settings?.enabled,
+      hasCallback: !!onCm93FeaturesRequest,
+      styleVersion,
+    });
+
+    // Helper to safely add a layer if it doesn't exist
+    const addLayerIfNotExists = (
+      layerId: string,
+      layerConfig: maplibregl.LayerSpecification,
+      beforeLayer?: string
+    ) => {
+      if (!map.getLayer(layerId)) {
+        try {
+          map.addLayer(layerConfig, beforeLayer);
+          console.debug(`Nautical: Added layer ${layerId}`);
+        } catch (err) {
+          console.error(`Nautical: Failed to add layer ${layerId}:`, err);
+        }
+      }
+    };
+
+    // Helper to remove a layer if it exists
+    const removeLayerIfExists = (layerId: string) => {
+      if (map.getLayer(layerId)) {
+        try {
+          map.removeLayer(layerId);
+          console.debug(`Nautical: Removed layer ${layerId}`);
+        } catch (err) {
+          console.error(`Nautical: Failed to remove layer ${layerId}:`, err);
+        }
+      }
+    };
+
+    // Ensure layers are created based on current settings
+    const ensureLayers = () => {
+      if (!map.getSource(NAUTICAL_SOURCE)) {
+        console.debug('Nautical: Source not ready, skipping layer creation');
+        return;
+      }
+
+      // Find insertion point - above basemap but below GEBCO and user charts
+      const beforeLayer = ['gebco-color-layer', 'gebco-hillshade-layer', 'gebco-hillshade-pre-layer']
+        .find(id => map.getLayer(id));
+
+      console.debug('Nautical: Ensuring layers exist, beforeLayer:', beforeLayer);
+
+      // Land areas - tan/beige fill
+      if (cm93Settings.showLand) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.land, {
+          id: NAUTICAL_LAYERS.land,
+          type: 'fill',
+          source: NAUTICAL_SOURCE,
+          filter: ['==', ['get', 'layer'], 'land'],
+          paint: {
+            'fill-color': theme === 'night' ? '#2d2d2d' : '#f5deb3',
+            'fill-opacity': cm93Settings.opacity * 0.8,
+          },
+        }, beforeLayer);
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.land);
+      }
+
+      // Depth areas - blue shading based on depth (always shown when nautical enabled)
+      addLayerIfNotExists(NAUTICAL_LAYERS.depthAreas, {
+        id: NAUTICAL_LAYERS.depthAreas,
+        type: 'fill',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'depth_areas'],
+        paint: {
+          'fill-color': [
+            'interpolate',
+            ['linear'],
+            ['coalesce', ['get', 'depth'], 0],
+            0, theme === 'night' ? '#1a3a5c' : '#add8e6',
+            10, theme === 'night' ? '#0d2840' : '#87ceeb',
+            50, theme === 'night' ? '#061a2e' : '#4682b4',
+            200, theme === 'night' ? '#030d17' : '#000080',
+          ],
+          'fill-opacity': cm93Settings.opacity * 0.5,
+        },
+      }, beforeLayer);
+
+      // Coastline - dark line (always shown when nautical enabled)
+      addLayerIfNotExists(NAUTICAL_LAYERS.coastline, {
+        id: NAUTICAL_LAYERS.coastline,
+        type: 'line',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'coastline'],
+        paint: {
+          'line-color': theme === 'night' ? '#666' : '#333',
+          'line-width': 1.5,
+          'line-opacity': cm93Settings.opacity,
+        },
+      }, beforeLayer);
+
+      // Depth contours - blue lines
+      if (cm93Settings.showDepthContours) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.depthContours, {
+          id: NAUTICAL_LAYERS.depthContours,
+          type: 'line',
+          source: NAUTICAL_SOURCE,
+          filter: ['==', ['get', 'layer'], 'depth_contours'],
+          paint: {
+            'line-color': theme === 'night' ? '#4a90d9' : '#4169e1',
+            'line-width': [
+              'interpolate',
+              ['linear'],
+              ['coalesce', ['get', 'depth'], 0],
+              0, 2,
+              10, 1.5,
+              50, 1,
+              200, 0.5,
+            ],
+            'line-opacity': cm93Settings.opacity * 0.7,
+          },
+        }, beforeLayer);
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.depthContours);
+      }
+
+      // Soundings - depth numbers
+      if (cm93Settings.showSoundings) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.soundings, {
+          id: NAUTICAL_LAYERS.soundings,
+          type: 'symbol',
+          source: NAUTICAL_SOURCE,
+          filter: ['==', ['get', 'layer'], 'soundings'],
+          layout: {
+            'text-field': ['to-string', ['round', ['get', 'depth']]],
+            'text-size': 10,
+            'text-anchor': 'center',
+            'text-allow-overlap': false,
+          },
+          paint: {
+            'text-color': theme === 'night' ? '#7ec8e3' : '#000080',
+            'text-halo-color': theme === 'night' ? '#1a1a2e' : '#ffffff',
+            'text-halo-width': 1,
+            'text-opacity': cm93Settings.opacity,
+          },
+        });
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.soundings);
+      }
+
+      // Lights - yellow/amber circles
+      if (cm93Settings.showLights) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.lights, {
+          id: NAUTICAL_LAYERS.lights,
+          type: 'circle',
+          source: NAUTICAL_SOURCE,
+          filter: ['==', ['get', 'layer'], 'lights'],
+          paint: {
+            'circle-radius': 6,
+            'circle-color': '#ffd700',
+            'circle-stroke-color': '#ff8c00',
+            'circle-stroke-width': 2,
+            'circle-opacity': cm93Settings.opacity,
+          },
+        });
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.lights);
+      }
+
+      // Buoys - colored circles based on type
+      if (cm93Settings.showBuoys) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.buoys, {
+          id: NAUTICAL_LAYERS.buoys,
+          type: 'circle',
+          source: NAUTICAL_SOURCE,
+          filter: ['any',
+            ['==', ['get', 'layer'], 'buoys'],
+            ['==', ['get', 'layer'], 'beacons']
+          ],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': [
+              'match',
+              ['get', 'color'],
+              'red', '#ff0000',
+              'green', '#00ff00',
+              'yellow', '#ffff00',
+              'white', '#ffffff',
+              '#888888' // default gray
+            ],
+            'circle-stroke-color': '#333',
+            'circle-stroke-width': 1,
+            'circle-opacity': cm93Settings.opacity,
+          },
+        });
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.buoys);
+      }
+
+      // Obstructions, wrecks, rocks - warning symbols
+      if (cm93Settings.showObstructions) {
+        addLayerIfNotExists(NAUTICAL_LAYERS.obstructions, {
+          id: NAUTICAL_LAYERS.obstructions,
+          type: 'circle',
+          source: NAUTICAL_SOURCE,
+          filter: ['any',
+            ['==', ['get', 'layer'], 'obstructions'],
+            ['==', ['get', 'layer'], 'wrecks'],
+            ['==', ['get', 'layer'], 'rocks']
+          ],
+          paint: {
+            'circle-radius': 4,
+            'circle-color': '#ff4444',
+            'circle-stroke-color': '#cc0000',
+            'circle-stroke-width': 1,
+            'circle-opacity': cm93Settings.opacity,
+          },
+        });
+      } else {
+        removeLayerIfExists(NAUTICAL_LAYERS.obstructions);
+      }
+
+      // Shoreline construction (piers, seawalls, etc.) - dark brown lines
+      addLayerIfNotExists(NAUTICAL_LAYERS.shoreline, {
+        id: NAUTICAL_LAYERS.shoreline,
+        type: 'line',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'shoreline'],
+        paint: {
+          'line-color': theme === 'night' ? '#8b7355' : '#654321',
+          'line-width': 2,
+          'line-opacity': cm93Settings.opacity,
+        },
+      }, beforeLayer);
+
+      // Intertidal areas (tidal flats) - subtle light brown fill
+      addLayerIfNotExists(NAUTICAL_LAYERS.intertidal, {
+        id: NAUTICAL_LAYERS.intertidal,
+        type: 'fill',
+        source: NAUTICAL_SOURCE,
+        filter: ['any',
+          ['==', ['get', 'layer'], 'intertidal'],
+          ['==', ['get', 'layer'], 'seabed']
+        ],
+        paint: {
+          'fill-color': theme === 'night' ? '#3d3d2d' : '#d2b48c',
+          'fill-opacity': cm93Settings.opacity * 0.2,
+        },
+      }, beforeLayer);
+
+      // Traffic separation zones - magenta outline only
+      addLayerIfNotExists(NAUTICAL_LAYERS.trafficSeparation, {
+        id: NAUTICAL_LAYERS.trafficSeparation,
+        type: 'line',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'traffic_separation'],
+        paint: {
+          'line-color': theme === 'night' ? '#8a6ada' : '#9370db',
+          'line-width': 2,
+          'line-opacity': cm93Settings.opacity * 0.7,
+        },
+      }, beforeLayer);
+
+      // Anchorage areas - very subtle blue fill
+      addLayerIfNotExists(NAUTICAL_LAYERS.anchorage, {
+        id: NAUTICAL_LAYERS.anchorage,
+        type: 'fill',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'anchorage'],
+        paint: {
+          'fill-color': theme === 'night' ? '#2a4a6a' : '#87ceeb',
+          'fill-opacity': cm93Settings.opacity * 0.15,
+          'fill-outline-color': theme === 'night' ? '#4a8aba' : '#4682b4',
+        },
+      }, beforeLayer);
+
+      // Caution areas - just outline, no fill (too visually dominant otherwise)
+      addLayerIfNotExists(NAUTICAL_LAYERS.cautionArea, {
+        id: NAUTICAL_LAYERS.cautionArea,
+        type: 'line',
+        source: NAUTICAL_SOURCE,
+        filter: ['==', ['get', 'layer'], 'caution_area'],
+        paint: {
+          'line-color': theme === 'night' ? '#ba8a4a' : '#ff8c00',
+          'line-width': 1.5,
+          'line-dasharray': [4, 2],
+          'line-opacity': cm93Settings.opacity * 0.6,
+        },
+      }, beforeLayer);
+
+      // Update opacity on standard layers (skip special layers with custom opacity)
+      const specialFillLayers = [NAUTICAL_LAYERS.anchorage, NAUTICAL_LAYERS.intertidal];
+      const specialLineLayers = [NAUTICAL_LAYERS.trafficSeparation, NAUTICAL_LAYERS.cautionArea];
+
+      Object.values(NAUTICAL_LAYERS).forEach(layerId => {
+        if (map.getLayer(layerId)) {
+          try {
+            const layer = map.getLayer(layerId);
+            if (layer?.type === 'fill' && !specialFillLayers.includes(layerId)) {
+              map.setPaintProperty(layerId, 'fill-opacity',
+                layerId === NAUTICAL_LAYERS.depthAreas ? cm93Settings.opacity * 0.5 : cm93Settings.opacity * 0.8);
+            } else if (layer?.type === 'line' && !specialLineLayers.includes(layerId)) {
+              map.setPaintProperty(layerId, 'line-opacity',
+                layerId === NAUTICAL_LAYERS.depthContours ? cm93Settings.opacity * 0.7 : cm93Settings.opacity);
+            } else if (layer?.type === 'circle') {
+              map.setPaintProperty(layerId, 'circle-opacity', cm93Settings.opacity);
+            } else if (layer?.type === 'symbol') {
+              map.setPaintProperty(layerId, 'text-opacity', cm93Settings.opacity);
+            }
+          } catch {
+            // Ignore errors
+          }
+        }
+      });
+
+      console.debug('Nautical: Layers ensured, current layers:',
+        Object.values(NAUTICAL_LAYERS).filter(id => map.getLayer(id)));
+    };
+
+    // Load features for current view
+    const loadFeatures = async () => {
+      const bounds = map.getBounds();
+      const zoom = Math.floor(map.getZoom());
+
+      console.log('Nautical: Loading features for zoom', zoom, 'bounds:', {
+        south: bounds.getSouth(),
+        west: bounds.getWest(),
+        north: bounds.getNorth(),
+        east: bounds.getEast(),
+      });
+
+      try {
+        const geojson = await onCm93FeaturesRequest(
+          bounds.getSouth(),
+          bounds.getWest(),
+          bounds.getNorth(),
+          bounds.getEast(),
+          zoom
+        );
+
+        if (isCancelled) return;
+
+        if (!geojson) {
+          console.debug('Nautical: No GeoJSON returned');
+          return;
+        }
+
+        console.log('Nautical: Received', geojson.features.length, 'features');
+
+        // Log a sample of the features to understand the data
+        if (geojson.features.length > 0) {
+          const layerTypes = new Set(geojson.features.map(f => f.properties?.layer));
+          console.log('Nautical: Feature layer types:', Array.from(layerTypes));
+
+          // Log first few features for debugging
+          console.log('Nautical: Sample features:', geojson.features.slice(0, 3));
+        } else {
+          console.warn('Nautical: No features returned from backend!');
+        }
+
+        // Convert to GeoJSON FeatureCollection
+        const featureCollection: GeoJSON.FeatureCollection = {
+          type: 'FeatureCollection',
+          features: geojson.features.map(f => ({
+            type: 'Feature' as const,
+            geometry: f.geometry as GeoJSON.Geometry,
+            properties: f.properties as GeoJSON.GeoJsonProperties,
+          })),
+        };
+
+        // Update or create source
+        const source = map.getSource(NAUTICAL_SOURCE) as maplibregl.GeoJSONSource | undefined;
+        if (source) {
+          console.debug('Nautical: Updating existing source with', featureCollection.features.length, 'features');
+          source.setData(featureCollection);
+        } else {
+          console.debug('Nautical: Creating new source with', featureCollection.features.length, 'features');
+          map.addSource(NAUTICAL_SOURCE, {
+            type: 'geojson',
+            data: featureCollection,
+          });
+        }
+
+        // Ensure layers exist after source is ready
+        ensureLayers();
+      } catch (err) {
+        console.error('Nautical: Failed to load features:', err);
+        console.error('Nautical: Error details:', {
+          initialized: cm93Status?.initialized,
+          enabled: cm93Settings?.enabled,
+        });
+      }
+    };
+
+    // Track in-flight request to avoid concurrent loads
+    let isLoading = false;
+    let debounceTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const debouncedLoadFeatures = () => {
+      // Clear any pending debounce
+      if (debounceTimeout) {
+        clearTimeout(debounceTimeout);
+      }
+
+      // Skip if already loading
+      if (isLoading) {
+        console.debug('Nautical: Skipping load, already in progress');
+        return;
+      }
+
+      // Debounce: wait 300ms after last move before loading
+      debounceTimeout = setTimeout(async () => {
+        if (isCancelled || isLoading) return;
+
+        isLoading = true;
+        try {
+          await loadFeatures();
+        } finally {
+          isLoading = false;
+        }
+      }, 300);
+    };
+
+    // Initial load (immediate, no debounce)
+    loadFeatures();
+
+    // Reload on map move (debounced)
+    map.on('moveend', debouncedLoadFeatures);
+
+    return () => {
+      isCancelled = true;
+      if (debounceTimeout) {
+        clearTimeout(debounceTimeout);
+      }
+      map.off('moveend', debouncedLoadFeatures);
+
+      // Clean up layers and source
+      console.debug('Nautical: Cleaning up layers and source');
+      try {
+        Object.values(NAUTICAL_LAYERS).forEach(layerId => {
+          if (map.getLayer(layerId)) {
+            map.removeLayer(layerId);
+          }
+        });
+        if (map.getSource(NAUTICAL_SOURCE)) {
+          map.removeSource(NAUTICAL_SOURCE);
+        }
+      } catch {
+        // Ignore errors during cleanup
+      }
+    };
+  }, [
+    cm93Status?.initialized,
+    cm93Settings?.enabled,
+    cm93Settings?.opacity,
+    cm93Settings?.showSoundings,
+    cm93Settings?.showDepthContours,
+    cm93Settings?.showLights,
+    cm93Settings?.showBuoys,
+    cm93Settings?.showLand,
+    cm93Settings?.showObstructions,
+    onCm93FeaturesRequest,
+    mapLoaded,
+    styleVersion,
+    theme,
+  ]);
+
+  // ============ GEBCO Bathymetry Layers ============
+  // Manage GEBCO layers: hillshade, color shading, and contours
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+
+    // Define GEBCO layer IDs
+    const GEBCO_COLOR_SOURCE = 'gebco-color';
+    const GEBCO_COLOR_LAYER = 'gebco-color-layer';
+    const GEBCO_HILLSHADE_SOURCE = 'gebco-dem';  // For dynamic hillshade (raster-dem)
+    const GEBCO_HILLSHADE_LAYER = 'gebco-hillshade-layer';
+    const GEBCO_PRERENDERED_SOURCE = 'gebco-hillshade-pre';  // For pre-rendered hillshade
+    const GEBCO_PRERENDERED_LAYER = 'gebco-hillshade-pre-layer';
+    const GEBCO_CONTOURS_SOURCE = 'gebco-contours';
+    const GEBCO_CONTOURS_LAYER = 'gebco-contours-layer';
+    const GEBCO_CONTOUR_LABELS_LAYER = 'gebco-contour-labels-layer';
+
+    // Helper to get theme-aware hillshade colors
+    const getHillshadeColors = () => {
+      switch (theme) {
+        case 'night':
+          return {
+            shadow: '#0d1b2a',
+            highlight: '#1b263b',
+            accent: '#415a77',
+          };
+        case 'dusk':
+          return {
+            shadow: '#1a237e',
+            highlight: '#e8eaf6',
+            accent: '#3949ab',
+          };
+        default: // day
+          return {
+            shadow: '#1a237e',
+            highlight: '#ffffff',
+            accent: '#0d47a1',
+          };
+      }
+    };
+
+    // Helper to get theme-aware contour color
+    const getContourColor = () => {
+      switch (theme) {
+        case 'night': return '#7986cb';
+        case 'dusk': return '#5c6bc0';
+        default: return '#1565c0';
+      }
+    };
+
+    // Check if GEBCO tiles are available
+    const colorAvailable = gebcoStatus?.color_available ?? false;
+    const demAvailable = gebcoStatus?.dem_available ?? false;
+    const hillshadeAvailable = gebcoStatus?.hillshade_available ?? false;
+    const contoursAvailable = gebcoStatus?.contours_available ?? false;
+    // Use DEM for dynamic hillshade, fall back to pre-rendered
+    const useDynamicHillshade = demAvailable;
+    const usePrerenderedHillshade = hillshadeAvailable && !demAvailable;
+
+    // Helper to safely add source
+    const addSourceSafely = (sourceId: string, config: maplibregl.SourceSpecification) => {
+      if (!map.getSource(sourceId)) {
+        try {
+          map.addSource(sourceId, config);
+        } catch (err) {
+          console.error(`GEBCO: Failed to add source ${sourceId}:`, err);
+        }
+      }
+    };
+
+    // Helper to safely remove layer and source
+    const removeLayerSafely = (layerId: string, sourceId?: string) => {
+      try {
+        if (map.getLayer(layerId)) {
+          map.removeLayer(layerId);
+        }
+        if (sourceId && map.getSource(sourceId)) {
+          // Only remove source if no other layers use it
+          const style = map.getStyle();
+          const layersUsingSource = style?.layers?.filter(
+            (l) => 'source' in l && l.source === sourceId
+          ) ?? [];
+          if (layersUsingSource.length === 0) {
+            map.removeSource(sourceId);
+          }
+        }
+      } catch (err) {
+        console.error(`GEBCO: Failed to remove layer ${layerId}:`, err);
+      }
+    };
+
+    // Get layer to insert before (after basemap, before charts)
+    const getInsertBeforeLayer = () => {
+      // Find first MBTiles layer (chart layer)
+      const style = map.getStyle();
+      const chartLayer = style?.layers?.find((l) => l.id.startsWith('mbtiles-layer-'));
+      if (chartLayer) return chartLayer.id;
+      // Otherwise, insert before OpenSeaMap if it exists
+      if (map.getLayer('openseamap-overlay')) return 'openseamap-overlay';
+      return undefined; // Add to top
+    };
+
+    // ---- GEBCO Color Layer (depth shading) ----
+    if (colorAvailable && gebcoSettings?.show_color) {
+      addSourceSafely(GEBCO_COLOR_SOURCE, {
+        type: 'raster',
+        tiles: ['mbtiles://_gebco_color/{z}/{x}/{y}'],
+        tileSize: 256,
+        minzoom: 0,
+        maxzoom: 9,
+      });
+
+      if (!map.getLayer(GEBCO_COLOR_LAYER)) {
+        try {
+          map.addLayer(
+            {
+              id: GEBCO_COLOR_LAYER,
+              type: 'raster',
+              source: GEBCO_COLOR_SOURCE,
+              paint: {
+                'raster-opacity': gebcoSettings.color_opacity,
+              },
+            },
+            getInsertBeforeLayer()
+          );
+        } catch (err) {
+          console.error('GEBCO: Failed to add color layer:', err);
+        }
+      } else {
+        // Update opacity
+        map.setPaintProperty(GEBCO_COLOR_LAYER, 'raster-opacity', gebcoSettings.color_opacity);
+      }
+    } else {
+      removeLayerSafely(GEBCO_COLOR_LAYER, GEBCO_COLOR_SOURCE);
+    }
+
+    // ---- GEBCO Hillshade Layer ----
+    // Option 1: Dynamic hillshade from Terrain-RGB DEM
+    if (useDynamicHillshade && gebcoSettings?.show_hillshade) {
+      // Remove pre-rendered if switching
+      removeLayerSafely(GEBCO_PRERENDERED_LAYER, GEBCO_PRERENDERED_SOURCE);
+
+      addSourceSafely(GEBCO_HILLSHADE_SOURCE, {
+        type: 'raster-dem',
+        tiles: ['mbtiles://_gebco_dem/{z}/{x}/{y}'],
+        tileSize: 256,
+        encoding: 'terrarium',
+      });
+
+      const hillshadeColors = getHillshadeColors();
+      if (!map.getLayer(GEBCO_HILLSHADE_LAYER)) {
+        try {
+          const beforeLayer = getInsertBeforeLayer();
+          map.addLayer(
+            {
+              id: GEBCO_HILLSHADE_LAYER,
+              type: 'hillshade',
+              source: GEBCO_HILLSHADE_SOURCE,
+              paint: {
+                'hillshade-exaggeration': 0.5,
+                'hillshade-shadow-color': hillshadeColors.shadow,
+                'hillshade-highlight-color': hillshadeColors.highlight,
+                'hillshade-accent-color': hillshadeColors.accent,
+                'hillshade-illumination-direction': 315,
+              },
+            },
+            beforeLayer
+          );
+        } catch (err) {
+          console.error('GEBCO: Failed to add dynamic hillshade layer:', err);
+        }
+      } else {
+        // Update hillshade colors for theme
+        map.setPaintProperty(GEBCO_HILLSHADE_LAYER, 'hillshade-shadow-color', hillshadeColors.shadow);
+        map.setPaintProperty(GEBCO_HILLSHADE_LAYER, 'hillshade-highlight-color', hillshadeColors.highlight);
+        map.setPaintProperty(GEBCO_HILLSHADE_LAYER, 'hillshade-accent-color', hillshadeColors.accent);
+      }
+    } else {
+      removeLayerSafely(GEBCO_HILLSHADE_LAYER, GEBCO_HILLSHADE_SOURCE);
+    }
+
+    // Option 2: Pre-rendered hillshade (simpler, no DEM encoding required)
+    if (usePrerenderedHillshade && gebcoSettings?.show_hillshade) {
+      addSourceSafely(GEBCO_PRERENDERED_SOURCE, {
+        type: 'raster',
+        tiles: ['mbtiles://_gebco_hillshade/{z}/{x}/{y}'],
+        tileSize: 256,
+        minzoom: 0,
+        maxzoom: 9,
+      });
+
+      if (!map.getLayer(GEBCO_PRERENDERED_LAYER)) {
+        try {
+          const beforeLayer = getInsertBeforeLayer();
+          map.addLayer(
+            {
+              id: GEBCO_PRERENDERED_LAYER,
+              type: 'raster',
+              source: GEBCO_PRERENDERED_SOURCE,
+              paint: {
+                'raster-opacity': gebcoSettings.hillshade_opacity,
+              },
+            },
+            beforeLayer
+          );
+        } catch (err) {
+          console.error('GEBCO: Failed to add pre-rendered hillshade layer:', err);
+        }
+      } else {
+        // Update opacity
+        map.setPaintProperty(GEBCO_PRERENDERED_LAYER, 'raster-opacity', gebcoSettings.hillshade_opacity);
+      }
+    } else if (!useDynamicHillshade) {
+      // Only remove if we're not using dynamic hillshade either
+      removeLayerSafely(GEBCO_PRERENDERED_LAYER, GEBCO_PRERENDERED_SOURCE);
+    }
+
+    // ---- GEBCO Contours Layer ----
+    if (contoursAvailable && gebcoSettings?.show_contours) {
+      addSourceSafely(GEBCO_CONTOURS_SOURCE, {
+        type: 'vector',
+        tiles: ['mbtiles://_gebco_contours/{z}/{x}/{y}'],
+        minzoom: 0,
+        maxzoom: 9,
+      });
+
+      const contourColor = getContourColor();
+      const contourInterval = gebcoSettings.contour_interval;
+
+      if (!map.getLayer(GEBCO_CONTOURS_LAYER)) {
+        try {
+          map.addLayer(
+            {
+              id: GEBCO_CONTOURS_LAYER,
+              type: 'line',
+              source: GEBCO_CONTOURS_SOURCE,
+              'source-layer': 'contours',
+              paint: {
+                'line-color': contourColor,
+                'line-width': [
+                  'case',
+                  ['==', ['%', ['get', 'depth'], 1000], 0], 2,
+                  ['==', ['%', ['get', 'depth'], 500], 0], 1.5,
+                  ['==', ['%', ['get', 'depth'], 100], 0], 1,
+                  0.5,
+                ],
+                'line-opacity': [
+                  'interpolate', ['linear'], ['zoom'],
+                  4, 0.3,
+                  8, 0.7,
+                  12, 1.0,
+                ],
+              },
+              filter: ['==', ['%', ['get', 'depth'], contourInterval], 0],
+            },
+            getInsertBeforeLayer()
+          );
+
+          // Add contour labels
+          map.addLayer(
+            {
+              id: GEBCO_CONTOUR_LABELS_LAYER,
+              type: 'symbol',
+              source: GEBCO_CONTOURS_SOURCE,
+              'source-layer': 'contours',
+              layout: {
+                'symbol-placement': 'line',
+                'text-field': ['concat', ['get', 'depth'], 'm'],
+                'text-size': 10,
+                'text-max-angle': 30,
+                'text-padding': 10,
+              },
+              paint: {
+                'text-color': contourColor,
+                'text-halo-color': theme === 'night' ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)',
+                'text-halo-width': 1.5,
+              },
+              filter: [
+                'all',
+                ['==', ['%', ['get', 'depth'], contourInterval], 0],
+                ['==', ['%', ['get', 'depth'], 100], 0],
+              ],
+            },
+            getInsertBeforeLayer()
+          );
+        } catch (err) {
+          console.error('GEBCO: Failed to add contour layers:', err);
+        }
+      } else {
+        // Update contour color and filter
+        map.setPaintProperty(GEBCO_CONTOURS_LAYER, 'line-color', contourColor);
+        map.setFilter(GEBCO_CONTOURS_LAYER, ['==', ['%', ['get', 'depth'], contourInterval], 0]);
+        if (map.getLayer(GEBCO_CONTOUR_LABELS_LAYER)) {
+          map.setPaintProperty(GEBCO_CONTOUR_LABELS_LAYER, 'text-color', contourColor);
+          map.setPaintProperty(
+            GEBCO_CONTOUR_LABELS_LAYER,
+            'text-halo-color',
+            theme === 'night' ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)'
+          );
+          map.setFilter(GEBCO_CONTOUR_LABELS_LAYER, [
+            'all',
+            ['==', ['%', ['get', 'depth'], contourInterval], 0],
+            ['==', ['%', ['get', 'depth'], 100], 0],
+          ]);
+        }
+      }
+    } else {
+      removeLayerSafely(GEBCO_CONTOUR_LABELS_LAYER);
+      removeLayerSafely(GEBCO_CONTOURS_LAYER, GEBCO_CONTOURS_SOURCE);
+    }
+
+    console.debug('GEBCO: Layer update complete', {
+      colorAvailable,
+      demAvailable,
+      contoursAvailable,
+      settings: gebcoSettings,
+    });
+  }, [
+    gebcoSettings?.show_color,
+    gebcoSettings?.show_hillshade,
+    gebcoSettings?.show_contours,
+    gebcoSettings?.color_opacity,
+    gebcoSettings?.hillshade_opacity,
+    gebcoSettings?.contour_interval,
+    gebcoStatus?.color_available,
+    gebcoStatus?.dem_available,
+    gebcoStatus?.contours_available,
+    theme,
+    mapLoaded,
+    styleVersion,
+  ]);
 
   // Update center when it changes
   useEffect(() => {
@@ -732,11 +2289,13 @@ export function MapView({
     }
   }, [orientationMode, vessel?.heading, vessel?.cog, mapLoaded]);
 
-  // Manage waypoint markers
+  // ============ WAYPOINT MARKERS WITH HASH-BASED RECREATION ============
+  // This is the key fix: markers are recreated when waypoint data (name/symbol) changes
   useEffect(() => {
     if (!mapRef.current || !mapLoaded) return;
 
     const currentMarkers = waypointMarkersRef.current;
+    const currentHashes = markerHashesRef.current;
     const waypointIds = new Set(waypoints.map((w) => w.id).filter((id): id is number => id !== null));
 
     // Remove markers for waypoints that no longer exist
@@ -744,6 +2303,27 @@ export function MapView({
       if (!waypointIds.has(id)) {
         marker.remove();
         currentMarkers.delete(id);
+        currentHashes.delete(id);
+      }
+    });
+
+    // Get waypoint IDs from the selected route (if any)
+    const selectedRouteWaypointIds = new Set<number>();
+    const selectedRoute = routes.find(r => r.route.id === selectedRouteId);
+    if (selectedRoute) {
+      selectedRoute.waypoints.forEach(wp => {
+        if (wp.id !== null) selectedRouteWaypointIds.add(wp.id);
+      });
+    }
+
+    // Get waypoint IDs that belong to hidden routes (but not active route)
+    const hiddenRouteWaypointIds = new Set<number>();
+    routes.forEach(r => {
+      // If route is hidden and not active, add its waypoints to the hidden set
+      if (r.route.hidden && r.route.id !== activeRouteId) {
+        r.waypoints.forEach(wp => {
+          if (wp.id !== null) hiddenRouteWaypointIds.add(wp.id);
+        });
       }
     });
 
@@ -751,242 +2331,305 @@ export function MapView({
     waypoints.forEach((waypoint) => {
       if (waypoint.id === null) return;
 
-      const isActive = waypoint.id === activeWaypointId;
-      const existingMarker = currentMarkers.get(waypoint.id);
+      const waypointId = waypoint.id;
+      const isActive = waypointId === activeWaypointId;
+      const isInSelectedRoute = selectedRouteWaypointIds.has(waypointId);
+      const isInHiddenRoute = hiddenRouteWaypointIds.has(waypointId);
+      const selectedRouteIsHidden = selectedRoute?.route.hidden ?? false;
 
-      if (existingMarker) {
-        // Update position if needed
+      // Determine if marker should be visible:
+      // - Active waypoint is ALWAYS visible (for navigation)
+      // - Waypoints in selected route are visible ONLY if the route itself is not hidden
+      // - Waypoints in hidden routes should be hidden (unless active)
+      // - Otherwise, both showAllMarkers must be true AND waypoint.hidden must be false
+      const isInVisibleSelectedRoute = isInSelectedRoute && !selectedRouteIsHidden;
+      const shouldBeVisible = isActive || isInVisibleSelectedRoute || (!isInHiddenRoute && showAllMarkers && !waypoint.hidden);
+
+      // Show label if global toggle is on AND waypoint's individual show_label is true
+      const shouldShowLabel = showAllLabels && waypoint.show_label;
+      const currentHash = getWaypointHash(waypoint, showAllLabels, showAllMarkers, isActive);
+      const existingHash = currentHashes.get(waypointId);
+      const existingMarker = currentMarkers.get(waypointId);
+
+      // If marker shouldn't be visible, remove it if it exists
+      if (!shouldBeVisible) {
+        if (existingMarker) {
+          existingMarker.remove();
+          currentMarkers.delete(waypointId);
+          currentHashes.delete(waypointId);
+        }
+        return;
+      }
+
+      // Check if marker exists and data hasn't changed
+      if (existingMarker && existingHash === currentHash) {
+        // Just update position and active state
         existingMarker.setLngLat([waypoint.lon, waypoint.lat]);
 
-        // Update active state by recreating element
         const el = existingMarker.getElement();
         if (isActive && !el.classList.contains('waypoint-marker--active')) {
           el.classList.add('waypoint-marker--active');
         } else if (!isActive && el.classList.contains('waypoint-marker--active')) {
           el.classList.remove('waypoint-marker--active');
         }
-      } else {
-        // Create new marker with drag support
-        const el = createWaypointMarkerElement(waypoint, isActive);
+        return;
+      }
 
-        // Drag state
-        let isDragging = false;
-        let dragTimeout: number | null = null;
-        let startPos: { x: number; y: number } | null = null;
+      // Data changed or new waypoint - recreate marker entirely
+      if (existingMarker) {
+        existingMarker.remove();
+        currentMarkers.delete(waypointId);
+      }
 
-        // Start drag after hold
-        const startDragMode = () => {
-          isDragging = true;
-          draggingWaypointRef.current = waypoint;
-          el.classList.add('waypoint-marker--dragging');
-          el.style.cursor = 'grabbing';
-        };
+      // Create new marker with fresh event handlers
+      const el = createWaypointMarkerElement(waypoint, isActive, shouldShowLabel);
 
-        // Mouse events for drag
-        const handleMouseDown = (e: MouseEvent) => {
-          if (e.button !== 0) return; // Only left click
-          e.stopPropagation();
-          startPos = { x: e.clientX, y: e.clientY };
+      // Drag state - uses ONLY waypointId, never captures waypoint data
+      let isDragging = false;
+      let dragTimeout: number | null = null;
+      let startPos: { x: number; y: number } | null = null;
 
-          // Start drag after 300ms hold
-          dragTimeout = window.setTimeout(() => {
-            startDragMode();
-          }, 300);
+      // Start drag after hold
+      const startDragMode = () => {
+        isDragging = true;
+        el.classList.add('waypoint-marker--dragging');
+        el.style.cursor = 'grabbing';
+        // Notify parent that drag started
+        const lngLat = marker.getLngLat();
+        onWaypointDragStartRef.current?.(waypointId, lngLat.lat, lngLat.lng);
+        // Track dragging position for route updates
+        setDraggingWaypointState({ id: waypointId, lat: lngLat.lat, lon: lngLat.lng });
+      };
 
-          const handleMouseMove = (moveEvent: MouseEvent) => {
-            if (!startPos) return;
+      // Mouse events for drag
+      const handleMouseDown = (e: MouseEvent) => {
+        if (e.button !== 0) return; // Only left click
+        e.stopPropagation();
+        startPos = { x: e.clientX, y: e.clientY };
 
-            const dx = moveEvent.clientX - startPos.x;
-            const dy = moveEvent.clientY - startPos.y;
+        // Start drag after 300ms hold
+        dragTimeout = window.setTimeout(() => {
+          startDragMode();
+        }, 300);
 
-            // Cancel drag timeout if moved before hold time
-            if (dragTimeout && Math.sqrt(dx * dx + dy * dy) > 5) {
-              clearTimeout(dragTimeout);
-              dragTimeout = null;
-            }
+        const handleMouseMove = (moveEvent: MouseEvent) => {
+          if (!startPos) return;
 
-            if (isDragging && mapRef.current) {
-              // Update marker position during drag
-              const rect = mapContainer.current?.getBoundingClientRect();
-              if (rect) {
-                const point = new maplibregl.Point(
-                  moveEvent.clientX - rect.left,
-                  moveEvent.clientY - rect.top
-                );
-                const lngLat = mapRef.current.unproject(point);
-                marker.setLngLat(lngLat);
-                // Report current drag position for real-time updates
-                onWaypointDragRef.current?.(waypoint, lngLat.lat, lngLat.lng);
-              }
-            }
-          };
+          const dx = moveEvent.clientX - startPos.x;
+          const dy = moveEvent.clientY - startPos.y;
 
-          const handleMouseUp = (upEvent: MouseEvent) => {
-            if (dragTimeout) {
-              clearTimeout(dragTimeout);
-              dragTimeout = null;
-            }
+          // Cancel drag timeout if moved before hold time
+          if (dragTimeout && Math.sqrt(dx * dx + dy * dy) > 5) {
+            clearTimeout(dragTimeout);
+            dragTimeout = null;
+          }
 
-            if (isDragging && mapRef.current) {
-              // Finish drag - update waypoint position
-              const lngLat = marker.getLngLat();
-              el.classList.remove('waypoint-marker--dragging');
-              el.style.cursor = '';
-              isDragging = false;
-              draggingWaypointRef.current = null;
-
-              onWaypointDragEndRef.current?.(waypoint, lngLat.lat, lngLat.lng);
-            } else if (startPos) {
-              // It was a click, not a drag
-              const dx = upEvent.clientX - startPos.x;
-              const dy = upEvent.clientY - startPos.y;
-              if (Math.sqrt(dx * dx + dy * dy) < 5) {
-                onWaypointClickRef.current?.(waypoint);
-              }
-            }
-
-            startPos = null;
-            document.removeEventListener('mousemove', handleMouseMove);
-            document.removeEventListener('mouseup', handleMouseUp);
-          };
-
-          document.addEventListener('mousemove', handleMouseMove);
-          document.addEventListener('mouseup', handleMouseUp);
-        };
-
-        // Touch events for drag and context menu
-        let contextMenuTimeout: number | null = null;
-        const handleTouchStart = (e: TouchEvent) => {
-          if (e.touches.length !== 1) return;
-          e.stopPropagation();
-
-          const touch = e.touches[0];
-          startPos = { x: touch.clientX, y: touch.clientY };
-
-          // Show context menu after 500ms hold (before drag starts)
-          contextMenuTimeout = window.setTimeout(() => {
+          if (isDragging && mapRef.current) {
+            // Update marker position during drag
             const rect = mapContainer.current?.getBoundingClientRect();
-            if (rect && startPos) {
-              // Vibrate on mobile if supported
-              if (navigator.vibrate) navigator.vibrate(50);
-              setWaypointContextMenu({
-                visible: true,
-                x: startPos.x - rect.left,
-                y: startPos.y - rect.top,
-                waypoint,
-              });
+            if (rect) {
+              const point = new maplibregl.Point(
+                moveEvent.clientX - rect.left,
+                moveEvent.clientY - rect.top
+              );
+              const lngLat = mapRef.current.unproject(point);
+              marker.setLngLat(lngLat);
+              // Report current drag position - use ID only!
+              onWaypointDragRef.current?.(waypointId, lngLat.lat, lngLat.lng);
+              // Update dragging position for route updates
+              setDraggingWaypointState({ id: waypointId, lat: lngLat.lat, lon: lngLat.lng });
             }
-            contextMenuTimeout = null;
-          }, 500);
-
-          const handleTouchMove = (moveEvent: TouchEvent) => {
-            if (!startPos || moveEvent.touches.length !== 1) return;
-
-            const touch = moveEvent.touches[0];
-            const dx = touch.clientX - startPos.x;
-            const dy = touch.clientY - startPos.y;
-
-            // Cancel context menu timeout if moved before hold time
-            if (contextMenuTimeout && Math.sqrt(dx * dx + dy * dy) > 10) {
-              clearTimeout(contextMenuTimeout);
-              contextMenuTimeout = null;
-            }
-
-            if (isDragging && mapRef.current) {
-              moveEvent.preventDefault(); // Prevent scroll during drag
-              const rect = mapContainer.current?.getBoundingClientRect();
-              if (rect) {
-                const point = new maplibregl.Point(
-                  touch.clientX - rect.left,
-                  touch.clientY - rect.top
-                );
-                const lngLat = mapRef.current.unproject(point);
-                marker.setLngLat(lngLat);
-                // Report current drag position for real-time updates
-                onWaypointDragRef.current?.(waypoint, lngLat.lat, lngLat.lng);
-              }
-            }
-          };
-
-          const handleTouchEnd = () => {
-            if (contextMenuTimeout) {
-              clearTimeout(contextMenuTimeout);
-              contextMenuTimeout = null;
-            }
-
-            if (isDragging && mapRef.current) {
-              const lngLat = marker.getLngLat();
-              el.classList.remove('waypoint-marker--dragging');
-              el.style.cursor = '';
-              isDragging = false;
-              draggingWaypointRef.current = null;
-
-              onWaypointDragEndRef.current?.(waypoint, lngLat.lat, lngLat.lng);
-            } else if (startPos) {
-              // It was a tap, not a drag (only if context menu wasn't shown)
-              if (!waypointContextMenu.visible) {
-                onWaypointClickRef.current?.(waypoint);
-              }
-            }
-
-            startPos = null;
-            el.removeEventListener('touchmove', handleTouchMove);
-            el.removeEventListener('touchend', handleTouchEnd);
-            el.removeEventListener('touchcancel', handleTouchEnd);
-          };
-
-          el.addEventListener('touchmove', handleTouchMove, { passive: false });
-          el.addEventListener('touchend', handleTouchEnd);
-          el.addEventListener('touchcancel', handleTouchEnd);
+          }
         };
 
-        el.addEventListener('mousedown', handleMouseDown);
-        el.addEventListener('touchstart', handleTouchStart, { passive: false });
+        const handleMouseUp = () => {
+          if (dragTimeout) {
+            clearTimeout(dragTimeout);
+            dragTimeout = null;
+          }
 
-        // Prevent default click since we handle it in mouseup
-        el.addEventListener('click', (e) => {
-          e.stopPropagation();
-        });
+          if (isDragging && mapRef.current) {
+            // Finish drag - use ID only!
+            const lngLat = marker.getLngLat();
+            el.classList.remove('waypoint-marker--dragging');
+            el.style.cursor = '';
+            isDragging = false;
+            onWaypointDragEndRef.current?.(waypointId, lngLat.lat, lngLat.lng);
+            // Clear dragging state
+            setDraggingWaypointState(null);
+          } else if (startPos) {
+            // It was a click, not a drag - use ID only!
+            onWaypointClickRef.current?.(waypointId);
+          }
 
-        // Right-click context menu for waypoint
-        el.addEventListener('contextmenu', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
+          startPos = null;
+          document.removeEventListener('mousemove', handleMouseMove);
+          document.removeEventListener('mouseup', handleMouseUp);
+        };
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+      };
+
+      // Touch events for drag and context menu
+      let contextMenuTimeout: number | null = null;
+      const handleTouchStart = (e: TouchEvent) => {
+        if (e.touches.length !== 1) return;
+        e.stopPropagation();
+
+        const touch = e.touches[0];
+        startPos = { x: touch.clientX, y: touch.clientY };
+
+        // Show context menu after 500ms hold (before drag starts)
+        contextMenuTimeout = window.setTimeout(() => {
           const rect = mapContainer.current?.getBoundingClientRect();
-          if (rect) {
+          if (rect && startPos) {
+            // Vibrate on mobile if supported
+            if (navigator.vibrate) navigator.vibrate(50);
             setWaypointContextMenu({
               visible: true,
-              x: e.clientX - rect.left,
-              y: e.clientY - rect.top,
-              waypoint,
+              x: startPos.x - rect.left,
+              y: startPos.y - rect.top,
+              waypointId,
             });
           }
-        });
+          contextMenuTimeout = null;
+        }, 500);
 
-        const marker = new maplibregl.Marker({
-          element: el,
-          anchor: 'bottom',
-        })
-          .setLngLat([waypoint.lon, waypoint.lat])
-          .addTo(mapRef.current!);
+        const handleTouchMove = (moveEvent: TouchEvent) => {
+          if (!startPos || moveEvent.touches.length !== 1) return;
 
-        currentMarkers.set(waypoint.id, marker);
-      }
+          const touch = moveEvent.touches[0];
+          const dx = touch.clientX - startPos.x;
+          const dy = touch.clientY - startPos.y;
+
+          // Cancel context menu timeout if moved before hold time
+          if (contextMenuTimeout && Math.sqrt(dx * dx + dy * dy) > 10) {
+            clearTimeout(contextMenuTimeout);
+            contextMenuTimeout = null;
+          }
+
+          if (isDragging && mapRef.current) {
+            moveEvent.preventDefault(); // Prevent scroll during drag
+            const rect = mapContainer.current?.getBoundingClientRect();
+            if (rect) {
+              const point = new maplibregl.Point(
+                touch.clientX - rect.left,
+                touch.clientY - rect.top
+              );
+              const lngLat = mapRef.current.unproject(point);
+              marker.setLngLat(lngLat);
+              // Report current drag position - use ID only!
+              onWaypointDragRef.current?.(waypointId, lngLat.lat, lngLat.lng);
+              // Update dragging position for route updates
+              setDraggingWaypointState({ id: waypointId, lat: lngLat.lat, lon: lngLat.lng });
+            }
+          }
+        };
+
+        const handleTouchEnd = () => {
+          if (contextMenuTimeout) {
+            clearTimeout(contextMenuTimeout);
+            contextMenuTimeout = null;
+          }
+
+          if (isDragging && mapRef.current) {
+            const lngLat = marker.getLngLat();
+            el.classList.remove('waypoint-marker--dragging');
+            el.style.cursor = '';
+            isDragging = false;
+            onWaypointDragEndRef.current?.(waypointId, lngLat.lat, lngLat.lng);
+            // Clear dragging state
+            setDraggingWaypointState(null);
+          } else if (startPos) {
+            // It was a tap, not a drag (only if context menu wasn't shown)
+            if (!waypointContextMenu.visible) {
+              onWaypointClickRef.current?.(waypointId);
+            }
+          }
+
+          startPos = null;
+          el.removeEventListener('touchmove', handleTouchMove);
+          el.removeEventListener('touchend', handleTouchEnd);
+          el.removeEventListener('touchcancel', handleTouchEnd);
+        };
+
+        el.addEventListener('touchmove', handleTouchMove, { passive: false });
+        el.addEventListener('touchend', handleTouchEnd);
+        el.addEventListener('touchcancel', handleTouchEnd);
+      };
+
+      el.addEventListener('mousedown', handleMouseDown);
+      el.addEventListener('touchstart', handleTouchStart, { passive: false });
+
+      // Prevent default click since we handle it in mouseup
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+      });
+
+      // Right-click context menu for waypoint
+      el.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = mapContainer.current?.getBoundingClientRect();
+        if (rect) {
+          setWaypointContextMenu({
+            visible: true,
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+            waypointId,
+          });
+        }
+      });
+
+      const marker = new maplibregl.Marker({
+        element: el,
+        anchor: 'bottom',
+      })
+        .setLngLat([waypoint.lon, waypoint.lat])
+        .addTo(mapRef.current!);
+
+      currentMarkers.set(waypointId, marker);
+      currentHashes.set(waypointId, currentHash);
     });
-  }, [waypoints, activeWaypointId, mapLoaded, theme]);
+  }, [waypoints, activeWaypointId, mapLoaded, theme, showAllLabels, showAllMarkers, selectedRouteId, routes, activeRouteId]);
 
-  // Draw navigation line from vessel to active waypoint
+  // Update waypoint marker in real-time when editing (name, symbol, and description)
+  useEffect(() => {
+    if (!editingPreview) return;
+
+    const marker = waypointMarkersRef.current.get(editingPreview.id);
+    if (marker) {
+      const el = marker.getElement();
+      // Update the label
+      const labelEl = el.querySelector('.waypoint-marker__label');
+      if (labelEl) {
+        labelEl.textContent = editingPreview.name || 'Waypoint';
+      }
+      // Update the icon/symbol
+      const iconEl = el.querySelector('.waypoint-marker__icon');
+      if (iconEl) {
+        const icon = WAYPOINT_SYMBOL_ICONS[editingPreview.symbol] || WAYPOINT_SYMBOL_ICONS['default'];
+        iconEl.textContent = icon;
+      }
+      // Update the tooltip (description)
+      el.title = editingPreview.description || '';
+    }
+  }, [editingPreview]);
+
+  // Draw enhanced navigation line from vessel to active waypoint with bearing/distance label
   useEffect(() => {
     if (!mapRef.current || !mapLoaded) return;
 
     const map = mapRef.current;
     const sourceId = 'nav-line-source';
-    const layerId = 'nav-line-layer';
+    const lineLayerId = 'nav-line-layer';
+    const labelLayerId = 'nav-line-label';
 
-    // Remove existing layer and source
-    if (map.getLayer(layerId)) {
-      map.removeLayer(layerId);
-    }
+    // Remove existing layers and source
+    [labelLayerId, lineLayerId].forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
     if (map.getSource(sourceId)) {
       map.removeSource(sourceId);
     }
@@ -997,38 +2640,215 @@ export function MapView({
     const activeWaypoint = waypoints.find((w) => w.id === activeWaypointId);
     if (!activeWaypoint) return;
 
-    // Add source with line coordinates
+    const vesselCoords: [number, number] = [vessel.position.lon, vessel.position.lat];
+    const waypointCoords: [number, number] = [activeWaypoint.lon, activeWaypoint.lat];
+
+    // Calculate midpoint for label placement
+    const midLat = (vessel.position.lat + activeWaypoint.lat) / 2;
+    const midLon = (vessel.position.lon + activeWaypoint.lon) / 2;
+
+    // Calculate bearing and distance for labels
+    const bearing = calculateBearing(
+      vessel.position.lat,
+      vessel.position.lon,
+      activeWaypoint.lat,
+      activeWaypoint.lon
+    );
+    const distance = calculateDistance(
+      vessel.position.lat,
+      vessel.position.lon,
+      activeWaypoint.lat,
+      activeWaypoint.lon
+    );
+
+    const labelText = `${formatBearing(bearing)}T  ${formatDistance(distance)}`;
+
+    // Add GeoJSON source with line and label point
     map.addSource(sourceId, {
       type: 'geojson',
       data: {
-        type: 'Feature',
-        properties: {},
-        geometry: {
-          type: 'LineString',
-          coordinates: [
-            [vessel.position.lon, vessel.position.lat],
-            [activeWaypoint.lon, activeWaypoint.lat],
-          ],
-        },
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: { type: 'line' },
+            geometry: {
+              type: 'LineString',
+              coordinates: [vesselCoords, waypointCoords],
+            },
+          },
+          {
+            type: 'Feature',
+            properties: { type: 'label', text: labelText },
+            geometry: {
+              type: 'Point',
+              coordinates: [midLon, midLat],
+            },
+          },
+        ],
       },
     });
 
-    // Add line layer
+    // Navigation course line - marine standard magenta/fuchsia
     map.addLayer({
-      id: layerId,
+      id: lineLayerId,
       type: 'line',
       source: sourceId,
+      filter: ['==', ['get', 'type'], 'line'],
       layout: {
         'line-join': 'round',
         'line-cap': 'round',
       },
       paint: {
-        'line-color': theme === 'night' ? '#ff6b6b' : '#e53e3e',
-        'line-width': 2,
-        'line-dasharray': [4, 4],
+        'line-color': theme === 'night' ? '#ff6b9d' : '#c026d3',
+        'line-width': 3,
+        'line-opacity': 0.9,
+      },
+    });
+
+    // Course label at midpoint
+    map.addLayer({
+      id: labelLayerId,
+      type: 'symbol',
+      source: sourceId,
+      filter: ['==', ['get', 'type'], 'label'],
+      layout: {
+        'text-field': ['get', 'text'],
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-size': 13,
+        'text-offset': [0, -1.2],
+        'text-anchor': 'center',
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+      },
+      paint: {
+        'text-color': theme === 'night' ? '#ffffff' : '#1a1a2e',
+        'text-halo-color': theme === 'night' ? '#1a1a2e' : '#ffffff',
+        'text-halo-width': 2,
       },
     });
   }, [vessel?.position, activeWaypointId, waypoints, mapLoaded, theme]);
+
+  // Draw navigation line from vessel to current waypoint when navigating a route
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const sourceId = 'route-nav-line-source';
+    const lineLayerId = 'route-nav-line-layer';
+    const labelLayerId = 'route-nav-line-label';
+
+    // Remove existing layers and source
+    [labelLayerId, lineLayerId].forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
+    if (map.getSource(sourceId)) {
+      map.removeSource(sourceId);
+    }
+
+    // Only draw line if we have vessel position and an active route
+    if (!vessel?.position || !activeRouteId) return;
+
+    // Find the active route
+    const activeRoute = routes.find(r => r.route.id === activeRouteId);
+    if (!activeRoute || activeRoute.waypoints.length === 0) return;
+
+    // Get the current target waypoint from the route
+    const targetWaypoint = activeRoute.waypoints[currentRouteWaypointIndex];
+    if (!targetWaypoint) return;
+
+    // Get the actual waypoint data (with current position if dragging)
+    const waypointData = waypoints.find(w => w.id === targetWaypoint.id);
+    if (!waypointData) return;
+
+    const vesselCoords: [number, number] = [vessel.position.lon, vessel.position.lat];
+    const waypointCoords: [number, number] = [waypointData.lon, waypointData.lat];
+
+    // Calculate midpoint for label placement
+    const midLat = (vessel.position.lat + waypointData.lat) / 2;
+    const midLon = (vessel.position.lon + waypointData.lon) / 2;
+
+    // Calculate bearing and distance for labels
+    const bearing = calculateBearing(
+      vessel.position.lat,
+      vessel.position.lon,
+      waypointData.lat,
+      waypointData.lon
+    );
+    const distance = calculateDistance(
+      vessel.position.lat,
+      vessel.position.lon,
+      waypointData.lat,
+      waypointData.lon
+    );
+
+    const labelText = `${formatBearing(bearing)}T  ${formatDistance(distance)}`;
+
+    // Add GeoJSON source with line and label point
+    map.addSource(sourceId, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: { type: 'line' },
+            geometry: {
+              type: 'LineString',
+              coordinates: [vesselCoords, waypointCoords],
+            },
+          },
+          {
+            type: 'Feature',
+            properties: { type: 'label', text: labelText },
+            geometry: {
+              type: 'Point',
+              coordinates: [midLon, midLat],
+            },
+          },
+        ],
+      },
+    });
+
+    // Navigation course line - marine standard magenta/fuchsia
+    map.addLayer({
+      id: lineLayerId,
+      type: 'line',
+      source: sourceId,
+      filter: ['==', ['get', 'type'], 'line'],
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': theme === 'night' ? '#ff6b9d' : '#c026d3',
+        'line-width': 3,
+        'line-opacity': 0.9,
+      },
+    });
+
+    // Course label at midpoint
+    map.addLayer({
+      id: labelLayerId,
+      type: 'symbol',
+      source: sourceId,
+      filter: ['==', ['get', 'type'], 'label'],
+      layout: {
+        'text-field': ['get', 'text'],
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-size': 13,
+        'text-offset': [0, -1.2],
+        'text-anchor': 'center',
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+      },
+      paint: {
+        'text-color': theme === 'night' ? '#ffffff' : '#1a1a2e',
+        'text-halo-color': theme === 'night' ? '#1a1a2e' : '#ffffff',
+        'text-halo-width': 2,
+      },
+    });
+  }, [vessel?.position, activeRouteId, routes, waypoints, currentRouteWaypointIndex, mapLoaded, theme]);
 
   // Manage pending waypoint marker (shown immediately on right-click)
   useEffect(() => {
@@ -1068,6 +2888,432 @@ export function MapView({
     }
   }, [pendingWaypoint, mapLoaded]);
 
+  // ============ ROUTE POLYLINES ============
+  // Render routes as polylines on the map
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const routeSourceId = 'routes-source';
+    const routeLayerId = 'routes-layer';
+    const activeRouteLayerId = 'active-route-layer';
+
+    // Remove existing layers
+    [activeRouteLayerId, routeLayerId].forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
+    if (map.getSource(routeSourceId)) {
+      map.removeSource(routeSourceId);
+    }
+
+    // Build a map of waypoint positions from the waypoints prop for fallback
+    const waypointPositionMap = new Map<number, { lat: number; lon: number }>();
+    waypoints.forEach(wp => {
+      if (wp.id !== null) {
+        waypointPositionMap.set(wp.id, { lat: wp.lat, lon: wp.lon });
+      }
+    });
+
+    // Build GeoJSON features for all routes
+    // Filter out hidden routes (unless they are active)
+    const features: GeoJSON.Feature[] = [];
+
+    routes.forEach((routeWithWaypoints) => {
+      const route = routeWithWaypoints.route;
+      const routeWaypoints = routeWithWaypoints.waypoints;
+
+      // Skip hidden routes (but always show active routes)
+      const isActive = route.id === activeRouteId;
+      if (route.hidden && !isActive) return;
+
+      if (routeWaypoints.length < 2) return;
+
+      // Build coordinates, using dragging position if waypoint is being dragged
+      // Also check waypoints prop for latest positions as fallback
+      const coordinates: [number, number][] = routeWaypoints.map(wp => {
+        const wpId = wp.id;
+
+        // First check if this waypoint is being dragged
+        if (draggingWaypointState && wpId !== null && wpId === draggingWaypointState.id) {
+          return [draggingWaypointState.lon, draggingWaypointState.lat];
+        }
+
+        // Fallback: check waypoints prop for current position (in case route waypoints are stale)
+        if (wpId !== null) {
+          const currentPos = waypointPositionMap.get(wpId);
+          if (currentPos) {
+            return [currentPos.lon, currentPos.lat];
+          }
+        }
+
+        // Final fallback: use the route's embedded waypoint position
+        return [wp.lon, wp.lat];
+      });
+
+      features.push({
+        type: 'Feature',
+        properties: {
+          routeId: route.id,
+          name: route.name,
+          color: route.color || '#c026d3',
+          isActive,
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates,
+        },
+      });
+    });
+
+    if (features.length === 0) return;
+
+    // Add GeoJSON source
+    map.addSource(routeSourceId, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features,
+      },
+    });
+
+    // Add inactive routes layer (dashed)
+    map.addLayer({
+      id: routeLayerId,
+      type: 'line',
+      source: routeSourceId,
+      filter: ['==', ['get', 'isActive'], false],
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': 2,
+        'line-dasharray': [4, 2],
+        'line-opacity': 0.7,
+      },
+    });
+
+    // Add active route layer (solid, thicker)
+    map.addLayer({
+      id: activeRouteLayerId,
+      type: 'line',
+      source: routeSourceId,
+      filter: ['==', ['get', 'isActive'], true],
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': 4,
+        'line-opacity': 1,
+      },
+    });
+  }, [routes, activeRouteId, mapLoaded, draggingWaypointState, waypoints]);
+
+  // ============ TRACK POLYLINES ============
+  // Render recorded tracks as polylines on the map
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const trackSourceId = 'tracks-source';
+    const trackLayerId = 'tracks-layer';
+    const recordingTrackLayerId = 'recording-track-layer';
+
+    // Remove existing layers
+    [recordingTrackLayerId, trackLayerId].forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    });
+    if (map.getSource(trackSourceId)) {
+      map.removeSource(trackSourceId);
+    }
+
+    // Build GeoJSON features for all tracks
+    // Filter out hidden tracks (unless they are recording)
+    const features: GeoJSON.Feature[] = [];
+
+    tracks.forEach((trackWithPoints) => {
+      const track = trackWithPoints.track;
+      const points = trackWithPoints.points;
+
+      // Skip hidden tracks (but always show recording tracks)
+      const isRecording = track.id === recordingTrackId;
+      if (track.hidden && !isRecording) return;
+
+      if (points.length < 2) return;
+
+      // Build coordinates from track points
+      const coordinates: [number, number][] = points.map(pt => [pt.lon, pt.lat]);
+
+      features.push({
+        type: 'Feature',
+        properties: {
+          trackId: track.id,
+          name: track.name,
+          color: track.color || '#06b6d4', // Cyan default for tracks
+          isRecording,
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates,
+        },
+      });
+    });
+
+    if (features.length === 0) return;
+
+    // Add GeoJSON source
+    map.addSource(trackSourceId, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features,
+      },
+    });
+
+    // Add completed tracks layer (solid line)
+    map.addLayer({
+      id: trackLayerId,
+      type: 'line',
+      source: trackSourceId,
+      filter: ['==', ['get', 'isRecording'], false],
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': 2,
+        'line-opacity': 0.8,
+      },
+    });
+
+    // Add recording track layer (thicker, red, pulsing effect via CSS)
+    map.addLayer({
+      id: recordingTrackLayerId,
+      type: 'line',
+      source: trackSourceId,
+      filter: ['==', ['get', 'isRecording'], true],
+      paint: {
+        'line-color': '#ef4444', // Red for recording
+        'line-width': 3,
+        'line-opacity': 1,
+      },
+    });
+  }, [tracks, recordingTrackId, mapLoaded]);
+
+  // ============ ACTIVE ROUTE WAYPOINT MARKERS ============
+  // Show colored markers for waypoints of the active route
+  // Green for current/next waypoint, blue for remaining waypoints
+  const activeRouteMarkersRef = useRef<maplibregl.Marker[]>([]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+
+    // Remove existing active route markers
+    activeRouteMarkersRef.current.forEach(marker => marker.remove());
+    activeRouteMarkersRef.current = [];
+
+    // Find the active route
+    const activeRoute = routes.find(r => r.route.id === activeRouteId);
+    if (!activeRoute || activeRoute.waypoints.length === 0) return;
+
+    // Create a map of waypoint IDs to current positions
+    const waypointPositions = new Map<number, { lat: number; lon: number; name: string }>();
+    waypoints.forEach(wp => {
+      if (wp.id !== null) {
+        waypointPositions.set(wp.id, { lat: wp.lat, lon: wp.lon, name: wp.name });
+      }
+    });
+
+    // Create colored markers for each waypoint in the active route
+    activeRoute.waypoints.forEach((routeWp, index) => {
+      if (routeWp.id === null) return;
+
+      // Get current position
+      let currentPos = waypointPositions.get(routeWp.id);
+      if (!currentPos) return;
+
+      // Use dragging position if being dragged
+      if (draggingWaypointState && routeWp.id === draggingWaypointState.id) {
+        currentPos = { ...currentPos, lat: draggingWaypointState.lat, lon: draggingWaypointState.lon };
+      }
+
+      // Determine marker color: green for current waypoint, blue for rest
+      const isCurrentWaypoint = index === currentRouteWaypointIndex;
+      const markerColor = isCurrentWaypoint ? '#22c55e' : '#3b82f6'; // green-500 / blue-500
+
+      const el = document.createElement('div');
+      el.className = `active-route-waypoint-marker ${isCurrentWaypoint ? 'active-route-waypoint-marker--current' : ''}`;
+      el.style.setProperty('--marker-color', markerColor);
+      el.innerHTML = `<span class="active-route-waypoint-marker__num">${index + 1}</span>`;
+      el.title = `${currentPos.name} (${isCurrentWaypoint ? 'Next waypoint' : `Waypoint ${index + 1}`})`;
+
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+        .setLngLat([currentPos.lon, currentPos.lat])
+        .addTo(map);
+
+      activeRouteMarkersRef.current.push(marker);
+    });
+
+    return () => {
+      activeRouteMarkersRef.current.forEach(marker => marker.remove());
+      activeRouteMarkersRef.current = [];
+    };
+  }, [activeRouteId, routes, waypoints, mapLoaded, currentRouteWaypointIndex, draggingWaypointState]);
+
+  // ============ ROUTE CREATION MODE ============
+  // Handle clicks during route creation to add waypoints
+  // Also render temporary waypoints and preview line
+  const routeCreationMarkersRef = useRef<maplibregl.Marker[]>([]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const creationSourceId = 'route-creation-source';
+    const creationLineLayerId = 'route-creation-line';
+
+    // Remove existing creation layers
+    if (map.getLayer(creationLineLayerId)) map.removeLayer(creationLineLayerId);
+    if (map.getSource(creationSourceId)) map.removeSource(creationSourceId);
+
+    // Remove existing temp markers
+    routeCreationMarkersRef.current.forEach(marker => marker.remove());
+    routeCreationMarkersRef.current = [];
+
+    if (!routeCreationModeActive || routeCreationWaypoints.length === 0) return;
+
+    // Add temp waypoint markers
+    routeCreationWaypoints.forEach((wp, index) => {
+      const el = document.createElement('div');
+      el.className = 'route-creation-marker';
+      el.innerHTML = `<span class="route-creation-marker__num">${index + 1}</span>`;
+
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+        .setLngLat([wp.lon, wp.lat])
+        .addTo(map);
+
+      routeCreationMarkersRef.current.push(marker);
+    });
+
+    // Draw preview line if we have at least 2 points
+    if (routeCreationWaypoints.length >= 2) {
+      const coordinates: [number, number][] = routeCreationWaypoints.map(wp => [wp.lon, wp.lat]);
+
+      map.addSource(creationSourceId, {
+        type: 'geojson',
+        data: {
+          type: 'Feature',
+          properties: {},
+          geometry: {
+            type: 'LineString',
+            coordinates,
+          },
+        },
+      });
+
+      map.addLayer({
+        id: creationLineLayerId,
+        type: 'line',
+        source: creationSourceId,
+        paint: {
+          'line-color': '#c026d3',
+          'line-width': 3,
+          'line-dasharray': [2, 2],
+          'line-opacity': 0.8,
+        },
+      });
+    }
+
+    // Cleanup on unmount
+    return () => {
+      routeCreationMarkersRef.current.forEach(marker => marker.remove());
+      routeCreationMarkersRef.current = [];
+    };
+  }, [routeCreationModeActive, routeCreationWaypoints, mapLoaded]);
+
+  // Handle map click during route creation mode
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded || !routeCreationModeActive) return;
+
+    const map = mapRef.current;
+
+    const handleClick = (e: maplibregl.MapMouseEvent) => {
+      onRouteCreationClick?.(e.lngLat.lat, e.lngLat.lng);
+    };
+
+    map.on('click', handleClick);
+
+    // Change cursor to crosshair during creation mode
+    map.getCanvas().style.cursor = 'crosshair';
+
+    return () => {
+      map.off('click', handleClick);
+      map.getCanvas().style.cursor = '';
+    };
+  }, [routeCreationModeActive, mapLoaded, onRouteCreationClick]);
+
+  // ============ SELECTED ROUTE WAYPOINT MARKERS ============
+  // Show numbered markers for waypoints when a route is selected/being edited
+  const selectedRouteMarkersRef = useRef<maplibregl.Marker[]>([]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+
+    // Remove existing selected route markers
+    selectedRouteMarkersRef.current.forEach(marker => marker.remove());
+    selectedRouteMarkersRef.current = [];
+
+    // Find the selected route
+    const selectedRoute = routes.find(r => r.route.id === selectedRouteId);
+    if (!selectedRoute || selectedRoute.waypoints.length === 0) return;
+
+    // Don't show markers for hidden routes
+    if (selectedRoute.route.hidden) return;
+
+    // Don't show during creation mode (to avoid confusion)
+    if (routeCreationModeActive) return;
+
+    const routeColor = selectedRoute.route.color || '#c026d3';
+
+    // Create a map of waypoint IDs to current positions from waypoints prop
+    // This ensures markers update when waypoints are dragged
+    const waypointPositions = new Map<number, { lat: number; lon: number; name: string }>();
+    waypoints.forEach(wp => {
+      if (wp.id !== null) {
+        waypointPositions.set(wp.id, { lat: wp.lat, lon: wp.lon, name: wp.name });
+      }
+    });
+
+    // Create numbered markers for each waypoint in the route
+    // Use order from route, but positions from waypoints prop or dragging state
+    selectedRoute.waypoints.forEach((routeWp, index) => {
+      if (routeWp.id === null) return;
+
+      // Get current position - prefer dragging state for real-time updates
+      let currentPos = waypointPositions.get(routeWp.id);
+      if (!currentPos) return;
+
+      // Use dragging position if this waypoint is being dragged
+      if (draggingWaypointState && routeWp.id === draggingWaypointState.id) {
+        currentPos = { ...currentPos, lat: draggingWaypointState.lat, lon: draggingWaypointState.lon };
+      }
+
+      const el = document.createElement('div');
+      el.className = 'route-waypoint-marker';
+      el.style.setProperty('--route-color', routeColor);
+      el.innerHTML = `<span class="route-waypoint-marker__num">${index + 1}</span>`;
+      el.title = `${currentPos.name} (Route waypoint ${index + 1})`;
+
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+        .setLngLat([currentPos.lon, currentPos.lat])
+        .addTo(map);
+
+      selectedRouteMarkersRef.current.push(marker);
+    });
+
+    // Cleanup
+    return () => {
+      selectedRouteMarkersRef.current.forEach(marker => marker.remove());
+      selectedRouteMarkersRef.current = [];
+    };
+  }, [selectedRouteId, routes, waypoints, mapLoaded, routeCreationModeActive, draggingWaypointState]);
+
   // Close context menus when clicking elsewhere
   const handleCloseContextMenu = () => {
     setContextMenu((prev) => ({ ...prev, visible: false }));
@@ -1081,16 +3327,32 @@ export function MapView({
 
   // Handle waypoint delete from context menu
   const handleWaypointDelete = () => {
-    if (waypointContextMenu.waypoint) {
-      onWaypointDeleteRef.current?.(waypointContextMenu.waypoint);
+    if (waypointContextMenu.waypointId !== null) {
+      onWaypointDeleteRef.current?.(waypointContextMenu.waypointId);
     }
     handleCloseWaypointContextMenu();
   };
 
   // Handle navigate to waypoint from context menu
   const handleWaypointNavigate = () => {
-    if (waypointContextMenu.waypoint) {
-      onWaypointClickRef.current?.(waypointContextMenu.waypoint);
+    if (waypointContextMenu.waypointId !== null) {
+      onWaypointNavigateRef.current?.(waypointContextMenu.waypointId);
+    }
+    handleCloseWaypointContextMenu();
+  };
+
+  // Handle edit waypoint from context menu
+  const handleWaypointEdit = () => {
+    if (waypointContextMenu.waypointId !== null) {
+      onWaypointEditRef.current?.(waypointContextMenu.waypointId);
+    }
+    handleCloseWaypointContextMenu();
+  };
+
+  // Handle toggle hidden from context menu
+  const handleWaypointToggleHidden = () => {
+    if (waypointContextMenu.waypointId !== null) {
+      onWaypointToggleHidden?.(waypointContextMenu.waypointId);
     }
     handleCloseWaypointContextMenu();
   };
@@ -1107,11 +3369,36 @@ export function MapView({
     handleCloseContextMenu();
   };
 
+  // Handle "Add Route" option - starts route creation with first waypoint at clicked location
+  const handleStartRouteCreation = () => {
+    onStartRouteCreationRef.current?.(contextMenu.lat, contextMenu.lon);
+    handleCloseContextMenu();
+  };
+
   // Toggle orientation mode
   const handleOrientationToggle = () => {
     const newMode = orientationMode === 'north-up' ? 'heading-up' : 'north-up';
     onOrientationModeChangeRef.current?.(newMode);
   };
+
+  // Toggle 3D mode (pitch)
+  const handle3DToggle = () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const newIs3D = !is3DMode;
+    setIs3DMode(newIs3D);
+
+    map.easeTo({
+      pitch: newIs3D ? 60 : 0, // Max pitch is 60 degrees
+      duration: 500,
+    });
+  };
+
+  // Get waypoint name for context menu header
+  const contextMenuWaypoint = waypointContextMenu.waypointId !== null
+    ? waypoints.find(w => w.id === waypointContextMenu.waypointId)
+    : null;
 
   return (
     <div
@@ -1143,6 +3430,32 @@ export function MapView({
         )}
       </button>
 
+      {/* 3D Mode Toggle Button */}
+      <button
+        className={`map-3d-toggle ${is3DMode ? 'map-3d-toggle--active' : ''}`}
+        onClick={handle3DToggle}
+        title={is3DMode ? 'Switch to 2D view' : 'Switch to 3D view'}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          {is3DMode ? (
+            // 3D active icon - tilted cube perspective
+            <>
+              <path d="M12 2 L22 7 L22 17 L12 22 L2 17 L2 7 Z" fill="none" />
+              <path d="M12 2 L12 12 L2 7" fill="none" />
+              <path d="M12 12 L22 7" fill="none" />
+              <path d="M12 12 L12 22" fill="none" />
+              <text x="12" y="16" textAnchor="middle" fontSize="7" fill="currentColor" stroke="none" fontWeight="bold">3D</text>
+            </>
+          ) : (
+            // 2D icon - flat square
+            <>
+              <rect x="4" y="4" width="16" height="16" rx="2" fill="none" />
+              <text x="12" y="15" textAnchor="middle" fontSize="7" fill="currentColor" stroke="none" fontWeight="bold">2D</text>
+            </>
+          )}
+        </svg>
+      </button>
+
       {/* Context Menu */}
       {contextMenu.visible && (
         <div
@@ -1169,11 +3482,19 @@ export function MapView({
             <span className="map-context-menu__icon">✏️</span>
             <span>Add with details...</span>
           </button>
+          <div className="map-context-menu__divider" />
+          <button
+            className="map-context-menu__item"
+            onClick={handleStartRouteCreation}
+          >
+            <span className="map-context-menu__icon">🗺️</span>
+            <span>Add Route</span>
+          </button>
         </div>
       )}
 
       {/* Waypoint Context Menu */}
-      {waypointContextMenu.visible && waypointContextMenu.waypoint && (
+      {waypointContextMenu.visible && waypointContextMenu.waypointId !== null && (
         <div
           className={`map-context-menu map-context-menu--${theme}`}
           style={{
@@ -1185,7 +3506,7 @@ export function MapView({
           onClick={(e) => e.stopPropagation()}
         >
           <div className="map-context-menu__header">
-            {waypointContextMenu.waypoint.name}
+            {contextMenuWaypoint?.name || 'Waypoint'}
           </div>
           <button
             className="map-context-menu__item"
@@ -1193,6 +3514,20 @@ export function MapView({
           >
             <span className="map-context-menu__icon">🧭</span>
             <span>Navigate to</span>
+          </button>
+          <button
+            className="map-context-menu__item"
+            onClick={handleWaypointEdit}
+          >
+            <span className="map-context-menu__icon">✏️</span>
+            <span>Edit waypoint</span>
+          </button>
+          <button
+            className="map-context-menu__item"
+            onClick={handleWaypointToggleHidden}
+          >
+            <span className="map-context-menu__icon">{contextMenuWaypoint?.hidden ? '👁️' : '👁️‍🗨️'}</span>
+            <span>{contextMenuWaypoint?.hidden ? 'Show on map' : 'Hide from map'}</span>
           </button>
           <button
             className="map-context-menu__item map-context-menu__item--danger"

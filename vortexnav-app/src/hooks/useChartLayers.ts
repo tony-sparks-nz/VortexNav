@@ -7,9 +7,12 @@ import {
   removeChart,
   saveChartLayerState,
   getChartLayerStates,
+  getAllChartCustomMetadata,
+  saveChartCustomMetadata,
   isTauri,
   type ChartInfo,
   type ChartLayerStateInput,
+  type ChartCustomMetadataInput,
 } from './useTauri';
 
 interface UseChartLayersReturn {
@@ -23,6 +26,7 @@ interface UseChartLayersReturn {
   toggleLayer: (chartId: string) => Promise<void>;
   setLayerOpacity: (chartId: string, opacity: number) => Promise<void>;
   zoomToLayer: (chartId: string) => [number, number, number, number] | null;
+  updateChartMetadata: (chartId: string, metadata: Partial<Omit<ChartCustomMetadataInput, 'chartId'>>) => Promise<void>;
 }
 
 /**
@@ -35,55 +39,196 @@ function getTileType(format: string | null): 'raster' | 'vector' {
 }
 
 /**
- * Parse bounds string "minlon,minlat,maxlon,maxlat" to array
- * Also handles antimeridian-crossing charts where bounds may be incorrectly wrapped
+ * Bounds analysis result for handling various edge cases
+ */
+type BoundsType = 'normal' | 'antimeridian-east-to-west' | 'antimeridian-west-to-east' | 'inverted';
+
+interface BoundsAnalysis {
+  type: BoundsType;
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+}
+
+/**
+ * Analyze bounds and determine how to handle them
+ *
+ * Antimeridian crossing patterns:
+ * Type A (east-to-west): minLon > 0 && maxLon < 0 (e.g., 175 to -175)
+ *   - Chart crosses going EAST from positive lon to negative lon through 180°
+ * Type B (west-to-east): minLon < 0 && maxLon > 0 && span > 180 (e.g., -175 to 175)
+ *   - Chart crosses going WEST from negative lon to positive lon through -180°/180°
+ *   - The "mathematical" span is >180° but the actual coverage is <180°
+ *
+ * Also handles:
+ * - Inverted bounds (minLon > maxLon, same sign) - swap to fix
+ * - Normal bounds (minLon < maxLon, standard case)
+ */
+function analyzeBounds(minLon: number, minLat: number, maxLon: number, maxLat: number): BoundsAnalysis {
+  const span = maxLon - minLon;
+
+  // Case 1: Antimeridian Type A - positive minLon, negative maxLon
+  // Example: 175°E to 175°W - crosses EAST through 180°
+  if (minLon > 0 && maxLon < 0) {
+    console.log(`Antimeridian crossing (east-to-west): ${minLon}° to ${maxLon}°`);
+    return { type: 'antimeridian-east-to-west', west: minLon, south: minLat, east: maxLon, north: maxLat };
+  }
+
+  // Case 2: Antimeridian Type B - negative minLon, positive maxLon, span > 180°
+  // Example: -174.55 to 175.53 - mathematical span is 350° but actual is ~10° crossing antimeridian
+  if (minLon < 0 && maxLon > 0 && span > 180) {
+    console.log(`Antimeridian crossing (west-to-east): ${minLon}° to ${maxLon}° (span ${span.toFixed(1)}°)`);
+    return { type: 'antimeridian-west-to-east', west: minLon, south: minLat, east: maxLon, north: maxLat };
+  }
+
+  // Case 3: Inverted bounds (minLon > maxLon but same sign)
+  // Likely a data entry error - swap to normalize
+  if (minLon > maxLon) {
+    console.log(`Inverted bounds: [${minLon}, ${maxLon}] -> [${maxLon}, ${minLon}]`);
+    return { type: 'inverted', west: maxLon, south: minLat, east: minLon, north: maxLat };
+  }
+
+  // Case 4: Normal bounds
+  return { type: 'normal', west: minLon, south: minLat, east: maxLon, north: maxLat };
+}
+
+/**
+ * Parse bounds string "minlon,minlat,maxlon,maxlat" for MapLibre source
+ *
+ * For antimeridian-crossing charts, returns undefined to disable bounds constraint
+ * (MapLibre doesn't support antimeridian-crossing bounds on sources)
+ *
+ * For inverted or normal bounds, returns normalized [west, south, east, north]
  */
 function parseBounds(bounds: string | null): [number, number, number, number] | undefined {
   if (!bounds) return undefined;
+
   const parts = bounds.split(',').map(Number);
-  if (parts.length !== 4 || !parts.every(n => !isNaN(n))) {
+  if (parts.length !== 4 || parts.some(n => isNaN(n))) {
     return undefined;
   }
 
-  let [minLon, minLat, maxLon, maxLat] = parts;
+  const [minLon, minLat, maxLon, maxLat] = parts;
+  const analysis = analyzeBounds(minLon, minLat, maxLon, maxLat);
 
-  // Detect and fix antimeridian-crossing bounds
-  // If the bounding box appears to span most of the world (> 300 degrees),
-  // it's likely an incorrectly interpreted antimeridian crossing
-  const lonSpan = maxLon - minLon;
-
-  if (lonSpan > 300) {
-    // This chart probably crosses the antimeridian incorrectly
-    // The bounds are likely inverted - we need to fix them for zoom-to-layer
-    console.log(`Detected antimeridian-crossing chart: [${minLon}, ${minLat}, ${maxLon}, ${maxLat}]`);
-
-    // For charts that should span across the dateline, swap the lon values
-    // and adjust for display. The actual small region is between maxLon and minLon
-    // wrapping around 180/-180
-    [minLon, maxLon] = [maxLon, minLon];
-
-    console.log(`Adjusted bounds for zoom: [${minLon}, ${minLat}, ${maxLon}, ${maxLat}]`);
+  // For any antimeridian-crossing type, disable bounds constraint
+  // MapLibre sources don't support antimeridian-crossing bounds
+  if (analysis.type === 'antimeridian-east-to-west' || analysis.type === 'antimeridian-west-to-east') {
+    console.log(`Disabling bounds constraint for antimeridian-crossing chart (${analysis.type})`);
+    return undefined;
   }
 
-  return [minLon, minLat, maxLon, maxLat] as [number, number, number, number];
+  // Return normalized bounds [west, south, east, north]
+  return [analysis.west, analysis.south, analysis.east, analysis.north];
+}
+
+/**
+ * Calculate the center and span for antimeridian-crossing bounds
+ */
+function calculateAntimeridianCenter(analysis: BoundsAnalysis): { center: number; span: number } {
+  if (analysis.type === 'antimeridian-east-to-west') {
+    // Type A: from positive (e.g., 175) to negative (e.g., -175)
+    // Chart spans: west (175) -> 180 -> east (-175)
+    const eastSpan = 180 - analysis.west;   // 180 - 175 = 5°
+    const westSpan = 180 + analysis.east;   // 180 + (-175) = 5°
+    const totalSpan = eastSpan + westSpan;  // 10°
+    const center = 180 - (westSpan / 2) + (eastSpan / 2);
+    const adjustedCenter = center > 180 ? center - 360 : center;
+    return { center: adjustedCenter, span: totalSpan };
+  } else {
+    // Type B: from negative (e.g., -175) to positive (e.g., 175)
+    // Chart spans: west (-175) -> -180/180 -> east (175)
+    const westSpan = 180 + analysis.west;   // 180 + (-175) = 5°
+    const eastSpan = 180 - analysis.east;   // 180 - 175 = 5°
+    const totalSpan = westSpan + eastSpan;  // 10°
+    const center = -180 + (westSpan / 2) - (eastSpan / 2);
+    const adjustedCenter = center < -180 ? center + 360 : center;
+    return { center: adjustedCenter, span: totalSpan };
+  }
+}
+
+/**
+ * Parse bounds for zoom-to functionality
+ *
+ * For antimeridian-crossing charts, we calculate the true center and span
+ * and return bounds that will zoom to the correct area.
+ */
+function parseBoundsForZoom(bounds: string | null): [number, number, number, number] | undefined {
+  if (!bounds) return undefined;
+
+  const parts = bounds.split(',').map(Number);
+  if (parts.length !== 4 || parts.some(n => isNaN(n))) {
+    return undefined;
+  }
+
+  const [minLon, minLat, maxLon, maxLat] = parts;
+  const analysis = analyzeBounds(minLon, minLat, maxLon, maxLat);
+
+  // Handle antimeridian-crossing charts
+  if (analysis.type === 'antimeridian-east-to-west' || analysis.type === 'antimeridian-west-to-east') {
+    const { center, span } = calculateAntimeridianCenter(analysis);
+    const halfSpan = Math.min(span / 2, 90); // Cap at reasonable zoom
+
+    // Create bounds around the center
+    // Note: These may cross the antimeridian, but at least center correctly
+    let zoomWest = center - halfSpan;
+    let zoomEast = center + halfSpan;
+
+    // Normalize to [-180, 180] range
+    if (zoomWest < -180) zoomWest += 360;
+    if (zoomEast > 180) zoomEast -= 360;
+
+    console.log(`Antimeridian zoom: center=${center.toFixed(2)}°, span=${span.toFixed(2)}° -> [${zoomWest.toFixed(2)}, ${zoomEast.toFixed(2)}]`);
+
+    // Return the side that's closest to the center of the chart for best zoom behavior
+    // For most antimeridian charts, using the dateline-crossing bounds works best
+    return [
+      Math.min(zoomWest, zoomEast),
+      analysis.south,
+      Math.max(zoomWest, zoomEast),
+      analysis.north
+    ];
+  }
+
+  // Return normalized bounds for normal/inverted cases
+  return [analysis.west, analysis.south, analysis.east, analysis.north];
 }
 
 /**
  * Convert ChartInfo and layer state to ChartLayer
  */
-function chartInfoToLayer(chart: ChartInfo, state?: ChartLayerStateInput): ChartLayer {
+function chartInfoToLayer(
+  chart: ChartInfo,
+  state?: ChartLayerStateInput,
+  customMeta?: ChartCustomMetadataInput
+): ChartLayer {
+  const boundsStr = chart.metadata.bounds;
+
+  // Use custom values if set, otherwise fall back to original metadata
+  const effectiveMinZoom = customMeta?.customMinZoom ?? chart.metadata.minzoom ?? undefined;
+  const effectiveMaxZoom = customMeta?.customMaxZoom ?? chart.metadata.maxzoom ?? undefined;
+
   return {
     id: chart.id,
     chartId: chart.id,
-    name: chart.name,
+    name: customMeta?.customName ?? chart.name,
     type: getTileType(chart.metadata.format),
     format: chart.metadata.format || 'png',
     enabled: state?.enabled ?? true,
     opacity: state?.opacity ?? 1.0,
     zOrder: state?.zOrder ?? 0,
-    bounds: parseBounds(chart.metadata.bounds),
-    minZoom: chart.metadata.minzoom ?? undefined,
-    maxZoom: chart.metadata.maxzoom ?? undefined,
+    bounds: parseBounds(boundsStr), // For MapLibre source (undefined for antimeridian-crossing)
+    zoomBounds: parseBoundsForZoom(boundsStr), // For zoom-to functionality
+    minZoom: effectiveMinZoom,
+    maxZoom: effectiveMaxZoom,
+    rawBoundsString: boundsStr ?? undefined,
+    // Store custom metadata for display and editing
+    description: chart.metadata.description ?? undefined,
+    customName: customMeta?.customName ?? undefined,
+    customDescription: customMeta?.customDescription ?? undefined,
+    customMinZoom: customMeta?.customMinZoom ?? undefined,
+    customMaxZoom: customMeta?.customMaxZoom ?? undefined,
   };
 }
 
@@ -103,18 +248,20 @@ export function useChartLayers(): UseChartLayersReturn {
       setIsLoading(true);
       setError(null);
 
-      // Load available charts and their saved states
-      const [charts, states] = await Promise.all([
+      // Load available charts, saved states, and custom metadata
+      const [charts, states, customMetadata] = await Promise.all([
         listCharts(),
         getChartLayerStates(),
+        getAllChartCustomMetadata(),
       ]);
 
-      // Create a map of states by chartId for quick lookup
+      // Create maps for quick lookup
       const stateMap = new Map(states.map(s => [s.chartId, s]));
+      const customMetaMap = new Map(customMetadata.map(m => [m.chartId, m]));
 
-      // Convert to ChartLayer, applying saved state
+      // Convert to ChartLayer, applying saved state and custom metadata
       const chartLayers = charts.map(chart =>
-        chartInfoToLayer(chart, stateMap.get(chart.id))
+        chartInfoToLayer(chart, stateMap.get(chart.id), customMetaMap.get(chart.id))
       );
 
       // Sort by zOrder
@@ -253,10 +400,54 @@ export function useChartLayers(): UseChartLayersReturn {
   }, [layers]);
 
   // Get bounds for a layer (for zoom-to functionality)
+  // Uses zoomBounds which handles antimeridian-crossing charts
   const zoomToLayer = useCallback((chartId: string): [number, number, number, number] | null => {
     const layer = layers.find(l => l.chartId === chartId);
-    return layer?.bounds ?? null;
+    return layer?.zoomBounds ?? layer?.bounds ?? null;
   }, [layers]);
+
+  // Update custom metadata for a chart
+  const updateChartMetadata = useCallback(async (
+    chartId: string,
+    metadata: Partial<Omit<ChartCustomMetadataInput, 'chartId'>>
+  ) => {
+    if (!isTauri()) return;
+
+    try {
+      const layer = layers.find(l => l.chartId === chartId);
+      if (!layer) return;
+
+      // Merge with existing custom metadata
+      const fullMetadata: ChartCustomMetadataInput = {
+        chartId,
+        customName: metadata.customName !== undefined ? metadata.customName : (layer.customName ?? null),
+        customDescription: metadata.customDescription !== undefined ? metadata.customDescription : (layer.customDescription ?? null),
+        customMinZoom: metadata.customMinZoom !== undefined ? metadata.customMinZoom : (layer.customMinZoom ?? null),
+        customMaxZoom: metadata.customMaxZoom !== undefined ? metadata.customMaxZoom : (layer.customMaxZoom ?? null),
+      };
+
+      // Update local state immediately for responsiveness
+      setLayers(prev => prev.map(l =>
+        l.chartId === chartId ? {
+          ...l,
+          name: fullMetadata.customName ?? l.name,
+          customName: fullMetadata.customName ?? undefined,
+          customDescription: fullMetadata.customDescription ?? undefined,
+          customMinZoom: fullMetadata.customMinZoom ?? undefined,
+          customMaxZoom: fullMetadata.customMaxZoom ?? undefined,
+          minZoom: fullMetadata.customMinZoom ?? l.minZoom,
+          maxZoom: fullMetadata.customMaxZoom ?? l.maxZoom,
+        } : l
+      ));
+
+      // Save to backend
+      await saveChartCustomMetadata(fullMetadata);
+    } catch (err) {
+      console.error('Failed to update chart metadata:', err);
+      // Revert on error
+      await refreshLayers();
+    }
+  }, [layers, refreshLayers]);
 
   return {
     layers,
@@ -269,5 +460,6 @@ export function useChartLayers(): UseChartLayersReturn {
     toggleLayer,
     setLayerOpacity,
     zoomToLayer,
+    updateChartMetadata,
   };
 }

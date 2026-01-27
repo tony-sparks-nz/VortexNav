@@ -10,6 +10,12 @@ interface ChartBarProps {
   viewportBounds: LngLatBounds | null;
   currentZoom: number;
   onToggleChart: (chartId: string) => void;
+  allChartsHidden: boolean;
+  onToggleAllCharts: () => void;
+  showChartOutlines: boolean;
+  onToggleChartOutlines: () => void;
+  highlightedChartId: string | null;
+  onChartHover: (chartId: string | null) => void;
 }
 
 type ChartType = 'rnc' | 'mbtiles';
@@ -100,14 +106,20 @@ export function ChartBar({
   viewportBounds,
   currentZoom,
   onToggleChart,
+  allChartsHidden,
+  onToggleAllCharts,
+  showChartOutlines,
+  onToggleChartOutlines,
+  highlightedChartId,
+  onChartHover,
 }: ChartBarProps) {
   const [tooltipChart, setTooltipChart] = useState<string | null>(null);
   const [tooltipPosition, setTooltipPosition] = useState({ x: 0, y: 0 });
 
   // Filter and sort charts
   const visibleCharts = useMemo(() => {
-    // Only consider charts WITH bounds - unbounded charts cannot be displayed
-    const chartsWithBounds = chartLayers.filter(l => l.bounds);
+    // Consider charts with bounds OR zoomBounds (zoomBounds exists for antimeridian-crossing charts)
+    const chartsWithBounds = chartLayers.filter(l => l.bounds || l.zoomBounds);
 
     // Debug: log filtering inputs (reduced verbosity)
     if (viewportBounds) {
@@ -127,13 +139,14 @@ export function ChartBar({
         return true;
       }
 
-      // Check bounds overlap
-      const overlaps = boundsOverlap(layer.bounds, viewportBounds);
+      // Check bounds overlap - use zoomBounds as fallback for antimeridian-crossing charts
+      const boundsToCheck = layer.bounds || layer.zoomBounds;
+      const overlaps = boundsOverlap(boundsToCheck, viewportBounds);
 
       if (!overlaps) {
         // Only log non-overlapping charts at debug level
         console.debug(`  Chart ${layer.chartId}: EXCLUDED (no overlap)`, {
-          bounds: layer.bounds?.map(n => n.toFixed(3)).join(', '),
+          bounds: boundsToCheck?.map(n => n.toFixed(3)).join(', '),
         });
         return false;
       }
@@ -191,15 +204,55 @@ export function ChartBar({
   }
 
   return (
-    <div className="chart-bar">
+    <div className={`chart-bar ${allChartsHidden ? 'chart-bar--all-hidden' : ''}`}>
+      {/* Global visibility toggle */}
+      <button
+        className={`chart-bar__toggle ${allChartsHidden ? 'chart-bar__toggle--off' : 'chart-bar__toggle--on'}`}
+        onClick={onToggleAllCharts}
+        title={allChartsHidden ? 'Show all charts' : 'Hide all charts'}
+        aria-label={allChartsHidden ? 'Show all charts' : 'Hide all charts'}
+        aria-pressed={!allChartsHidden}
+      >
+        {allChartsHidden ? (
+          // Eye-off icon
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+            <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+            <line x1="1" y1="1" x2="23" y2="23" />
+          </svg>
+        ) : (
+          // Eye icon
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        )}
+      </button>
+
+      {/* Chart outlines toggle */}
+      <button
+        className={`chart-bar__toggle chart-bar__toggle--outline ${showChartOutlines ? 'chart-bar__toggle--on' : 'chart-bar__toggle--off'}`}
+        onClick={onToggleChartOutlines}
+        title={showChartOutlines ? 'Hide chart outlines' : 'Show chart outlines'}
+        aria-label={showChartOutlines ? 'Hide chart outlines' : 'Show chart outlines'}
+        aria-pressed={showChartOutlines}
+      >
+        {/* Rectangle/frame icon */}
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+        </svg>
+      </button>
+
       {visibleCharts.map((layer) => {
         const chartType = getChartType(layer);
         const displayName = getDisplayName(layer);
+        const isHighlighted = showChartOutlines && highlightedChartId === layer.chartId;
 
         const className = [
           'chart-bar__item',
           `chart-bar__item--${chartType}`,
           layer.enabled ? 'chart-bar__item--enabled' : 'chart-bar__item--disabled',
+          isHighlighted ? 'chart-bar__item--highlighted' : '',
         ].join(' ');
 
         return (
@@ -207,6 +260,8 @@ export function ChartBar({
             key={layer.chartId}
             className={className}
             onClick={() => onToggleChart(layer.chartId)}
+            onMouseEnter={() => showChartOutlines && onChartHover(layer.chartId)}
+            onMouseLeave={() => showChartOutlines && onChartHover(null)}
             onContextMenu={(e) => {
               e.preventDefault();
               handleLongPress(layer.chartId, e);

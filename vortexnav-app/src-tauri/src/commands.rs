@@ -2,7 +2,8 @@
 
 use crate::catalog_parser::{parse_catalog_file, parse_catalog_xml};
 use crate::chart_converter::{check_gdal_available, convert_to_mbtiles, get_mbtiles_output_path, write_mbtiles_metadata, GdalInfo};
-use crate::database::{AppSettings, CatalogChart, ChartCatalog, ChartLayerState, ConfigDatabase, GpsSourceRecord, MBTilesMetadata, MBTilesReader, Waypoint};
+use crate::cm93::{Cm93Server, GeoJsonTile};
+use crate::database::{AppSettings, BaseNauticalSettings, CatalogChart, ChartCatalog, ChartCustomMetadata, ChartLayerState, Cm93Settings, ConfigDatabase, GebcoSettings, GpsSourceRecord, MBTilesMetadata, MBTilesReader, Route, RouteStatistics, RouteTag, RouteWithWaypoints, Track, TrackPoint, TrackWithPoints, Waypoint};
 use crate::download_manager::{download_file, extract_zip, categorize_extracted_files, fetch_catalog_url, filename_from_url, DownloadState};
 use crate::gps::{DetectedPort, GpsManager, GpsSourceConfig, GpsSourceStatus, GpsSourceType};
 use crate::nmea::GpsData;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub gps_manager: GpsManager,
     pub mbtiles_readers: Mutex<HashMap<String, MBTilesReader>>,
     pub charts_dir: PathBuf,
+    pub cm93_server: Mutex<Option<Cm93Server>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +53,347 @@ pub fn get_settings(state: State<AppState>) -> CommandResult<AppSettings> {
 #[tauri::command]
 pub fn save_settings(settings: AppSettings, state: State<AppState>) -> CommandResult<()> {
     match state.config_db.save_all_settings(&settings) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// ============ GEBCO Bathymetry Commands ============
+
+/// Status of GEBCO data availability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GebcoStatus {
+    pub dem_available: bool,
+    pub hillshade_available: bool,  // Pre-rendered hillshade (alternative to DEM)
+    pub color_available: bool,
+    pub contours_available: bool,
+    pub dem_path: Option<String>,
+    pub dem_size_bytes: Option<u64>,
+}
+
+/// Get GEBCO bathymetry data status
+#[tauri::command]
+pub fn get_gebco_status(state: State<AppState>) -> CommandResult<GebcoStatus> {
+    let charts_dir = &state.charts_dir;
+
+    // Check for GEBCO DEM tiles (terrain-rgb for dynamic hillshade)
+    let dem_path = charts_dir.join("_gebco_dem.mbtiles");
+    let dem_available = dem_path.exists();
+    let dem_size_bytes = if dem_available {
+        std::fs::metadata(&dem_path).ok().map(|m| m.len())
+    } else {
+        None
+    };
+
+    // Check for pre-rendered hillshade tiles (alternative to DEM)
+    let hillshade_path = charts_dir.join("_gebco_hillshade.mbtiles");
+    let hillshade_available = hillshade_path.exists();
+
+    // Check for GEBCO color tiles
+    let color_path = charts_dir.join("_gebco_color.mbtiles");
+    let color_available = color_path.exists();
+
+    // Check for GEBCO contour tiles
+    let contours_path = charts_dir.join("_gebco_contours.mbtiles");
+    let contours_available = contours_path.exists();
+
+    CommandResult::ok(GebcoStatus {
+        dem_available,
+        hillshade_available,
+        color_available,
+        contours_available,
+        dem_path: if dem_available { dem_path.to_str().map(|s| s.to_string()) } else { None },
+        dem_size_bytes,
+    })
+}
+
+/// Get GEBCO settings
+#[tauri::command]
+pub fn get_gebco_settings(state: State<AppState>) -> CommandResult<GebcoSettings> {
+    match state.config_db.get_gebco_settings() {
+        Ok(settings) => CommandResult::ok(settings),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Save GEBCO settings
+#[tauri::command]
+pub fn save_gebco_settings(settings: GebcoSettings, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.save_gebco_settings(&settings) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// ============ Base Nautical Chart Commands ============
+
+/// Status of base nautical chart availability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseNauticalStatus {
+    pub available: bool,
+    pub path: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+/// Get base nautical chart status
+#[tauri::command]
+pub fn get_base_nautical_status(state: State<AppState>) -> CommandResult<BaseNauticalStatus> {
+    let mbtiles_path = state.charts_dir.join("_base_nautical.mbtiles");
+    let available = mbtiles_path.exists();
+    let size_bytes = if available {
+        std::fs::metadata(&mbtiles_path).ok().map(|m| m.len())
+    } else {
+        None
+    };
+
+    CommandResult::ok(BaseNauticalStatus {
+        available,
+        path: if available { mbtiles_path.to_str().map(String::from) } else { None },
+        size_bytes,
+    })
+}
+
+/// Get base nautical chart settings
+#[tauri::command]
+pub fn get_base_nautical_settings(state: State<AppState>) -> CommandResult<BaseNauticalSettings> {
+    match state.config_db.get_base_nautical_settings() {
+        Ok(settings) => CommandResult::ok(settings),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Save base nautical chart settings
+#[tauri::command]
+pub fn save_base_nautical_settings(settings: BaseNauticalSettings, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.save_base_nautical_settings(&settings) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Result of CM93 conversion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cm93ConversionResult {
+    pub success: bool,
+    pub output_path: Option<String>,
+    pub tiles_rendered: usize,
+    pub error: Option<String>,
+}
+
+/// Convert CM93 chart database to MBTiles
+/// This creates the _base_nautical.mbtiles file from CM93 data
+#[tauri::command]
+pub async fn convert_cm93_to_base_nautical(
+    cm93_path: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<CommandResult<Cm93ConversionResult>, String> {
+    use crate::cm93::convert_cm93_to_mbtiles;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let cm93_dir = Path::new(&cm93_path);
+    if !cm93_dir.exists() {
+        return Ok(CommandResult::ok(Cm93ConversionResult {
+            success: false,
+            output_path: None,
+            tiles_rendered: 0,
+            error: Some(format!("CM93 directory not found: {}", cm93_path)),
+        }));
+    }
+
+    let output_path = state.charts_dir.join("_base_nautical.mbtiles");
+
+    // Delete existing file if present
+    if output_path.exists() {
+        if let Err(e) = std::fs::remove_file(&output_path) {
+            return Ok(CommandResult::ok(Cm93ConversionResult {
+                success: false,
+                output_path: None,
+                tiles_rendered: 0,
+                error: Some(format!("Failed to remove existing file: {}", e)),
+            }));
+        }
+    }
+
+    let tiles_rendered = Arc::new(AtomicUsize::new(0));
+    let tiles_rendered_clone = tiles_rendered.clone();
+    let app_handle = app.clone();
+
+    // Progress callback
+    let progress_callback = Box::new(move |current: usize, total: usize| {
+        tiles_rendered_clone.store(current, Ordering::SeqCst);
+        // Emit progress event every 100 tiles
+        if current % 100 == 0 {
+            let _ = app_handle.emit("cm93-conversion-progress", serde_json::json!({
+                "current": current,
+                "total": total,
+                "percent": if total > 0 { (current * 100) / total } else { 0 }
+            }));
+        }
+    });
+
+    // Run conversion
+    match convert_cm93_to_mbtiles(
+        cm93_dir,
+        &output_path,
+        0,  // min_zoom
+        14, // max_zoom
+        Some(progress_callback),
+    ) {
+        Ok(_) => {
+            let final_tiles = tiles_rendered.load(Ordering::SeqCst);
+            log::info!("CM93 conversion complete: {} tiles rendered", final_tiles);
+            Ok(CommandResult::ok(Cm93ConversionResult {
+                success: true,
+                output_path: output_path.to_str().map(String::from),
+                tiles_rendered: final_tiles,
+                error: None,
+            }))
+        }
+        Err(e) => {
+            log::error!("CM93 conversion failed: {}", e);
+            Ok(CommandResult::ok(Cm93ConversionResult {
+                success: false,
+                output_path: None,
+                tiles_rendered: tiles_rendered.load(Ordering::SeqCst),
+                error: Some(e.to_string()),
+            }))
+        }
+    }
+}
+
+// ============ CM93 Vector Tile Commands ============
+
+/// Status of CM93 vector chart server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cm93Status {
+    pub initialized: bool,
+    pub available_scales: Vec<char>,
+    pub path: Option<String>,
+}
+
+/// Initialize the CM93 vector chart server
+#[tauri::command]
+pub fn init_cm93_server(path: String, state: State<AppState>) -> CommandResult<Cm93Status> {
+    use std::path::Path;
+
+    let cm93_path = Path::new(&path);
+    if !cm93_path.exists() {
+        return CommandResult::err(&format!("CM93 directory not found: {}", path));
+    }
+
+    match Cm93Server::open(cm93_path) {
+        Ok(server) => {
+            let scales = server.available_scales();
+            let is_available = server.is_available();
+
+            let mut cm93_lock = state.cm93_server.lock().unwrap();
+            *cm93_lock = Some(server);
+
+            log::info!("CM93 server initialized with scales: {:?}", scales);
+
+            CommandResult::ok(Cm93Status {
+                initialized: is_available,
+                available_scales: scales,
+                path: Some(path),
+            })
+        }
+        Err(e) => {
+            log::error!("Failed to initialize CM93 server: {}", e);
+            CommandResult::err(&e.to_string())
+        }
+    }
+}
+
+/// Get CM93 server status
+#[tauri::command]
+pub fn get_cm93_status(state: State<AppState>) -> CommandResult<Cm93Status> {
+    let cm93_lock = state.cm93_server.lock().unwrap();
+
+    match cm93_lock.as_ref() {
+        Some(server) => CommandResult::ok(Cm93Status {
+            initialized: server.is_available(),
+            available_scales: server.available_scales(),
+            path: None, // Path not stored in server
+        }),
+        None => CommandResult::ok(Cm93Status {
+            initialized: false,
+            available_scales: Vec::new(),
+            path: None,
+        }),
+    }
+}
+
+/// Get CM93 vector features as GeoJSON for a tile
+#[tauri::command]
+pub fn get_cm93_tile(z: u8, x: u32, y: u32, state: State<AppState>) -> CommandResult<GeoJsonTile> {
+    let cm93_lock = state.cm93_server.lock().unwrap();
+
+    match cm93_lock.as_ref() {
+        Some(server) => match server.get_tile_geojson(z, x, y) {
+            Ok(tile) => CommandResult::ok(tile),
+            Err(e) => CommandResult::err(&e.to_string()),
+        },
+        None => CommandResult::err("CM93 server not initialized"),
+    }
+}
+
+/// Get CM93 vector features as GeoJSON for a bounding box
+#[tauri::command]
+pub fn get_cm93_features(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    zoom: u8,
+    state: State<AppState>,
+) -> CommandResult<GeoJsonTile> {
+    eprintln!(
+        "[CM93] get_features: bounds=({:.4},{:.4}) to ({:.4},{:.4}), zoom={}",
+        min_lat, min_lon, max_lat, max_lon, zoom
+    );
+
+    let cm93_lock = state.cm93_server.lock().unwrap();
+
+    match cm93_lock.as_ref() {
+        Some(server) => {
+            match server.get_features_in_bounds(min_lat, min_lon, max_lat, max_lon, zoom) {
+                Ok(tile) => {
+                    eprintln!(
+                        "[CM93] Returned {} features at scale {}",
+                        tile.features.len(),
+                        tile.tile_info.scale
+                    );
+                    CommandResult::ok(tile)
+                }
+                Err(e) => {
+                    eprintln!("[CM93] ERROR: {}", e);
+                    CommandResult::err(&e.to_string())
+                }
+            }
+        }
+        None => {
+            eprintln!("[CM93] ERROR: Server not initialized!");
+            CommandResult::err("CM93 server not initialized")
+        }
+    }
+}
+
+/// Get CM93 visualization settings
+#[tauri::command]
+pub fn get_cm93_settings(state: State<AppState>) -> CommandResult<Cm93Settings> {
+    match state.config_db.get_cm93_settings() {
+        Ok(settings) => CommandResult::ok(settings),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Save CM93 visualization settings
+#[tauri::command]
+pub fn save_cm93_settings(settings: Cm93Settings, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.save_cm93_settings(&settings) {
         Ok(_) => CommandResult::ok(()),
         Err(e) => CommandResult::err(&e.to_string()),
     }
@@ -228,12 +571,843 @@ pub fn update_waypoint(waypoint: Waypoint, state: State<AppState>) -> CommandRes
     }
 }
 
+/// Update only the position (lat/lon) of a waypoint.
+/// This is safe for drag operations - it won't overwrite name/symbol/description.
+#[tauri::command]
+pub fn update_waypoint_position(id: i64, lat: f64, lon: f64, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.update_waypoint_position(id, lat, lon) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
 #[tauri::command]
 pub fn delete_waypoint(id: i64, state: State<AppState>) -> CommandResult<()> {
     match state.config_db.delete_waypoint(id) {
         Ok(_) => CommandResult::ok(()),
         Err(e) => CommandResult::err(&e.to_string()),
     }
+}
+
+#[tauri::command]
+pub fn toggle_waypoint_hidden(id: i64, hidden: bool, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.toggle_waypoint_hidden(id, hidden) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// ============ Route Commands ============
+
+#[tauri::command]
+pub fn get_routes(state: State<AppState>) -> CommandResult<Vec<RouteWithWaypoints>> {
+    match state.config_db.get_routes() {
+        Ok(routes) => CommandResult::ok(routes),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_route(id: i64, state: State<AppState>) -> CommandResult<RouteWithWaypoints> {
+    match state.config_db.get_route(id) {
+        Ok(Some(route)) => CommandResult::ok(route),
+        Ok(None) => CommandResult::err(&format!("Route with id {} not found", id)),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn create_route(
+    route: Route,
+    waypoint_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+    state: State<AppState>,
+) -> CommandResult<i64> {
+    match state.config_db.create_route(&route, &waypoint_ids, &tag_ids) {
+        Ok(id) => CommandResult::ok(id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn update_route(
+    route: Route,
+    waypoint_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+    state: State<AppState>,
+) -> CommandResult<()> {
+    match state.config_db.update_route(&route, &waypoint_ids, &tag_ids) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn delete_route(id: i64, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.delete_route(id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn duplicate_route(id: i64, new_name: String, state: State<AppState>) -> CommandResult<i64> {
+    match state.config_db.duplicate_route(id, &new_name) {
+        Ok(new_id) => CommandResult::ok(new_id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn reverse_route(id: i64, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.reverse_route(id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn set_active_route(id: Option<i64>, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.set_active_route(id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn toggle_route_hidden(id: i64, hidden: bool, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.toggle_route_hidden(id, hidden) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get the count of waypoints that are exclusive to this route (not used by other routes).
+/// This helps the UI show how many waypoints would be deleted if the user chooses to delete them.
+#[tauri::command]
+pub fn get_route_exclusive_waypoint_count(id: i64, state: State<AppState>) -> CommandResult<usize> {
+    match state.config_db.get_exclusive_route_waypoints(id) {
+        Ok(waypoint_ids) => CommandResult::ok(waypoint_ids.len()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Delete a route and optionally delete its exclusive waypoints (waypoints not used by other routes).
+/// Returns the IDs of waypoints that were deleted.
+#[tauri::command]
+pub fn delete_route_with_waypoints(
+    id: i64,
+    delete_waypoints: bool,
+    state: State<AppState>,
+) -> CommandResult<Vec<i64>> {
+    match state.config_db.delete_route_with_waypoints(id, delete_waypoints) {
+        Ok(deleted_waypoint_ids) => CommandResult::ok(deleted_waypoint_ids),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// ============ Route Tag Commands ============
+
+#[tauri::command]
+pub fn get_route_tags(state: State<AppState>) -> CommandResult<Vec<RouteTag>> {
+    match state.config_db.get_route_tags() {
+        Ok(tags) => CommandResult::ok(tags),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn create_route_tag(tag: RouteTag, state: State<AppState>) -> CommandResult<i64> {
+    match state.config_db.create_route_tag(&tag) {
+        Ok(id) => CommandResult::ok(id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn update_route_tag(tag: RouteTag, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.update_route_tag(&tag) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn delete_route_tag(id: i64, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.delete_route_tag(id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// ============ Route Statistics Commands ============
+
+#[tauri::command]
+pub fn calculate_route_statistics(
+    waypoint_ids: Vec<i64>,
+    speed_kn: f64,
+    state: State<AppState>,
+) -> CommandResult<RouteStatistics> {
+    // Get waypoints by their IDs in order
+    let mut waypoints = Vec::new();
+    for id in &waypoint_ids {
+        match state.config_db.get_waypoint(*id) {
+            Ok(Some(wp)) => waypoints.push(wp),
+            Ok(None) => return CommandResult::err(&format!("Waypoint {} not found", id)),
+            Err(e) => return CommandResult::err(&e.to_string()),
+        }
+    }
+
+    // Calculate statistics
+    let stats = calculate_statistics(&waypoints, speed_kn);
+    CommandResult::ok(stats)
+}
+
+/// Calculate route statistics from a list of waypoints
+fn calculate_statistics(waypoints: &[Waypoint], speed_kn: f64) -> RouteStatistics {
+    let mut total_distance_nm = 0.0;
+    let mut leg_distances = Vec::new();
+    let mut leg_bearings = Vec::new();
+
+    for i in 0..waypoints.len().saturating_sub(1) {
+        let from = &waypoints[i];
+        let to = &waypoints[i + 1];
+
+        let distance = haversine_distance(from.lat, from.lon, to.lat, to.lon);
+        let bearing = calculate_bearing(from.lat, from.lon, to.lat, to.lon);
+
+        total_distance_nm += distance;
+        leg_distances.push(distance);
+        leg_bearings.push(bearing);
+    }
+
+    let estimated_time_hours = if speed_kn > 0.0 {
+        total_distance_nm / speed_kn
+    } else {
+        0.0
+    };
+
+    RouteStatistics {
+        total_distance_nm,
+        waypoint_count: waypoints.len(),
+        estimated_time_hours,
+        leg_distances,
+        leg_bearings,
+    }
+}
+
+/// Calculate distance between two points using Haversine formula
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_NM: f64 = 3440.065; // Earth radius in nautical miles
+
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let delta_lat = (lat2 - lat1).to_radians();
+    let delta_lon = (lon2 - lon1).to_radians();
+
+    let a = (delta_lat / 2.0).sin().powi(2)
+        + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+
+    EARTH_RADIUS_NM * c
+}
+
+/// Calculate initial bearing from point 1 to point 2
+fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let delta_lon = (lon2 - lon1).to_radians();
+
+    let y = delta_lon.sin() * lat2_rad.cos();
+    let x = lat1_rad.cos() * lat2_rad.sin() - lat1_rad.sin() * lat2_rad.cos() * delta_lon.cos();
+
+    let bearing_rad = y.atan2(x);
+    let bearing_deg = bearing_rad.to_degrees();
+
+    // Normalize to 0-360
+    (bearing_deg + 360.0) % 360.0
+}
+
+// ============ Track Commands ============
+
+/// Get all tracks
+#[tauri::command]
+pub fn get_tracks(state: State<AppState>) -> CommandResult<Vec<Track>> {
+    match state.config_db.get_tracks() {
+        Ok(tracks) => CommandResult::ok(tracks),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get a track by ID
+#[tauri::command]
+pub fn get_track(id: i64, state: State<AppState>) -> CommandResult<Track> {
+    match state.config_db.get_track(id) {
+        Ok(Some(track)) => CommandResult::ok(track),
+        Ok(None) => CommandResult::err(&format!("Track with id {} not found", id)),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get a track with all its points
+#[tauri::command]
+pub fn get_track_with_points(id: i64, state: State<AppState>) -> CommandResult<TrackWithPoints> {
+    match state.config_db.get_track_with_points(id) {
+        Ok(Some(track)) => CommandResult::ok(track),
+        Ok(None) => CommandResult::err(&format!("Track with id {} not found", id)),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get all tracks with their points
+#[tauri::command]
+pub fn get_tracks_with_points(state: State<AppState>) -> CommandResult<Vec<TrackWithPoints>> {
+    match state.config_db.get_tracks_with_points() {
+        Ok(tracks) => CommandResult::ok(tracks),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Start recording a new track
+#[tauri::command]
+pub fn start_track_recording(name: String, state: State<AppState>) -> CommandResult<i64> {
+    // Check if there's already a recording track
+    match state.config_db.get_recording_track() {
+        Ok(Some(_)) => return CommandResult::err("A track is already being recorded. Stop it first."),
+        Ok(None) => {},
+        Err(e) => return CommandResult::err(&e.to_string()),
+    }
+
+    match state.config_db.start_track_recording(&name) {
+        Ok(id) => CommandResult::ok(id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Stop recording the current track
+#[tauri::command]
+pub fn stop_track_recording(state: State<AppState>) -> CommandResult<Option<Track>> {
+    // Get the recording track
+    let track = match state.config_db.get_recording_track() {
+        Ok(Some(t)) => t,
+        Ok(None) => return CommandResult::err("No track is currently being recorded"),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    let track_id = track.id.unwrap();
+
+    // Stop recording
+    if let Err(e) = state.config_db.stop_track_recording(track_id) {
+        return CommandResult::err(&e.to_string());
+    }
+
+    // Return the updated track
+    match state.config_db.get_track(track_id) {
+        Ok(t) => CommandResult::ok(t),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get the currently recording track (if any)
+#[tauri::command]
+pub fn get_recording_track(state: State<AppState>) -> CommandResult<Option<Track>> {
+    match state.config_db.get_recording_track() {
+        Ok(track) => CommandResult::ok(track),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Add a point to the currently recording track
+#[tauri::command]
+pub fn add_track_point(
+    lat: f64,
+    lon: f64,
+    heading: Option<f64>,
+    cog: Option<f64>,
+    sog: Option<f64>,
+    state: State<AppState>,
+) -> CommandResult<i64> {
+    // Get the recording track
+    let track = match state.config_db.get_recording_track() {
+        Ok(Some(t)) => t,
+        Ok(None) => return CommandResult::err("No track is currently being recorded"),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    let track_id = track.id.unwrap();
+
+    match state.config_db.add_track_point(track_id, lat, lon, heading, cog, sog) {
+        Ok(point_id) => CommandResult::ok(point_id),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Update track metadata
+#[tauri::command]
+pub fn update_track(track: Track, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.update_track(&track) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Toggle track visibility
+#[tauri::command]
+pub fn toggle_track_hidden(id: i64, hidden: bool, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.toggle_track_hidden(id, hidden) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Delete a track and all its points
+#[tauri::command]
+pub fn delete_track(id: i64, state: State<AppState>) -> CommandResult<()> {
+    match state.config_db.delete_track(id) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Get track points for a track
+#[tauri::command]
+pub fn get_track_points(track_id: i64, state: State<AppState>) -> CommandResult<Vec<TrackPoint>> {
+    match state.config_db.get_track_points(track_id) {
+        Ok(points) => CommandResult::ok(points),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+/// Export a track to GPX format (returns the GPX string)
+#[tauri::command]
+pub fn get_track_gpx_string(track_id: i64, state: State<AppState>) -> CommandResult<String> {
+    // Get track with points
+    let track_with_points = match state.config_db.get_track_with_points(track_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return CommandResult::err(&format!("Track with id {} not found", track_id)),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    // Generate GPX
+    match gpx::generate_track_gpx(&track_with_points) {
+        Ok(gpx_string) => CommandResult::ok(gpx_string),
+        Err(e) => CommandResult::err(&e),
+    }
+}
+
+/// Export a track to a GPX file
+#[tauri::command]
+pub fn export_track_gpx(track_id: i64, file_path: String, state: State<AppState>) -> CommandResult<()> {
+    // Get track with points
+    let track_with_points = match state.config_db.get_track_with_points(track_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return CommandResult::err(&format!("Track with id {} not found", track_id)),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    // Generate GPX
+    let gpx_string = match gpx::generate_track_gpx(&track_with_points) {
+        Ok(s) => s,
+        Err(e) => return CommandResult::err(&e),
+    };
+
+    // Write to file
+    match std::fs::write(&file_path, gpx_string) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&format!("Failed to write GPX file: {}", e)),
+    }
+}
+
+/// Convert a track to a route (simplifies points to waypoints)
+#[tauri::command]
+pub fn convert_track_to_route(
+    track_id: i64,
+    max_waypoints: usize,
+    state: State<AppState>,
+) -> CommandResult<i64> {
+    // Get track with points
+    let track_with_points = match state.config_db.get_track_with_points(track_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return CommandResult::err(&format!("Track with id {} not found", track_id)),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    let track = &track_with_points.track;
+    let points = &track_with_points.points;
+
+    if points.is_empty() {
+        return CommandResult::err("Track has no points");
+    }
+
+    // Simplify track points to waypoints using Douglas-Peucker or simple sampling
+    let simplified = simplify_track_points(points, max_waypoints);
+
+    // Create waypoints from simplified points
+    let mut waypoint_ids = Vec::new();
+    for (i, point) in simplified.iter().enumerate() {
+        let waypoint = crate::database::Waypoint {
+            id: None,
+            name: format!("{}_{}", track.name, i + 1),
+            lat: point.lat,
+            lon: point.lon,
+            description: Some(format!("From track: {}", track.name)),
+            symbol: None,
+            show_label: true,
+            hidden: false,
+            created_at: None,
+        };
+
+        match state.config_db.create_waypoint(&waypoint) {
+            Ok(id) => waypoint_ids.push(id),
+            Err(e) => return CommandResult::err(&format!("Failed to create waypoint: {}", e)),
+        }
+    }
+
+    // Create route from waypoints
+    let route = crate::database::Route {
+        name: format!("{} (from track)", track.name),
+        description: track.description.clone(),
+        color: track.color.clone(),
+        total_distance_nm: track.total_distance_nm,
+        ..Default::default()
+    };
+
+    match state.config_db.create_route(&route, &waypoint_ids, &[]) {
+        Ok(route_id) => CommandResult::ok(route_id),
+        Err(e) => CommandResult::err(&format!("Failed to create route: {}", e)),
+    }
+}
+
+/// Simplify track points using simple sampling
+fn simplify_track_points(points: &[TrackPoint], max_waypoints: usize) -> Vec<TrackPoint> {
+    if points.len() <= max_waypoints {
+        return points.to_vec();
+    }
+
+    if max_waypoints < 2 {
+        // Return first and last
+        return vec![points.first().unwrap().clone(), points.last().unwrap().clone()];
+    }
+
+    // Sample points evenly, always including first and last
+    let mut result = Vec::with_capacity(max_waypoints);
+    let step = (points.len() - 1) as f64 / (max_waypoints - 1) as f64;
+
+    for i in 0..max_waypoints {
+        let index = (i as f64 * step).round() as usize;
+        let index = index.min(points.len() - 1);
+        result.push(points[index].clone());
+    }
+
+    result
+}
+
+// ============ GPX Import/Export Commands ============
+
+use crate::gpx::{self, GpxImportResult, GpxRoute, GpxRoutePoint};
+
+/// Import a GPX file, creating routes and waypoints
+#[tauri::command]
+pub fn import_gpx(file_path: String, state: State<AppState>) -> CommandResult<GpxImportResult> {
+    let path = std::path::Path::new(&file_path);
+
+    // Parse the GPX file
+    let parsed = match gpx::parse_gpx_file(path) {
+        Ok(p) => p,
+        Err(e) => return CommandResult::err(&format!("Failed to parse GPX file: {}", e)),
+    };
+
+    let mut result = GpxImportResult {
+        routes_imported: 0,
+        waypoints_imported: 0,
+        tracks_imported: 0,
+        errors: Vec::new(),
+    };
+
+    // Import standalone waypoints
+    for wpt in parsed.waypoints {
+        let waypoint = Waypoint {
+            id: None,
+            name: wpt.name.unwrap_or_else(|| format!("Waypoint {}", result.waypoints_imported + 1)),
+            lat: wpt.lat,
+            lon: wpt.lon,
+            description: wpt.desc,
+            symbol: wpt.sym,
+            show_label: true,
+            hidden: false,
+            created_at: None,
+        };
+
+        match state.config_db.create_waypoint(&waypoint) {
+            Ok(_) => result.waypoints_imported += 1,
+            Err(e) => result.errors.push(format!("Failed to import waypoint: {}", e)),
+        }
+    }
+
+    // Import routes
+    for rte in parsed.routes {
+        let route_name = rte.name.unwrap_or_else(|| format!("Imported Route {}", result.routes_imported + 1));
+
+        // First, create waypoints for route points
+        let mut waypoint_ids = Vec::new();
+        for (idx, pt) in rte.points.iter().enumerate() {
+            let waypoint = Waypoint {
+                id: None,
+                name: pt.name.clone().unwrap_or_else(|| format!("{} - WP{}", route_name, idx + 1)),
+                lat: pt.lat,
+                lon: pt.lon,
+                description: pt.desc.clone(),
+                symbol: pt.sym.clone(),
+                show_label: true,
+                hidden: false,
+                created_at: None,
+            };
+
+            match state.config_db.create_waypoint(&waypoint) {
+                Ok(id) => {
+                    waypoint_ids.push(id);
+                    result.waypoints_imported += 1;
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to create waypoint for route: {}", e));
+                }
+            }
+        }
+
+        // Create the route
+        if !waypoint_ids.is_empty() {
+            let route = Route {
+                id: None,
+                name: route_name.clone(),
+                description: rte.desc,
+                color: Some("#c026d3".to_string()), // Default magenta
+                is_active: false,
+                hidden: false,
+                total_distance_nm: None, // Will be calculated
+                estimated_speed_kn: 5.0,
+                created_at: None,
+                updated_at: None,
+            };
+
+            match state.config_db.create_route(&route, &waypoint_ids, &[]) {
+                Ok(_) => result.routes_imported += 1,
+                Err(e) => result.errors.push(format!("Failed to create route '{}': {}", route_name, e)),
+            }
+        }
+    }
+
+    // Import tracks (convert to routes)
+    for trk in parsed.tracks {
+        let track_name = trk.name.unwrap_or_else(|| format!("Imported Track {}", result.tracks_imported + 1));
+
+        // Combine all segments into one route
+        let mut all_points: Vec<&GpxRoutePoint> = Vec::new();
+        for seg in &trk.segments {
+            all_points.extend(seg.iter());
+        }
+
+        if all_points.is_empty() {
+            continue;
+        }
+
+        // Create waypoints for track points (may be many, so sample if needed)
+        let mut waypoint_ids = Vec::new();
+        let sample_rate = if all_points.len() > 50 { all_points.len() / 50 } else { 1 };
+
+        for (idx, pt) in all_points.iter().enumerate() {
+            if idx % sample_rate != 0 && idx != all_points.len() - 1 {
+                continue; // Sample points for large tracks, but always include last point
+            }
+
+            let waypoint = Waypoint {
+                id: None,
+                name: pt.name.clone().unwrap_or_else(|| format!("{} - PT{}", track_name, waypoint_ids.len() + 1)),
+                lat: pt.lat,
+                lon: pt.lon,
+                description: pt.desc.clone(),
+                symbol: pt.sym.clone(),
+                show_label: false, // Tracks often have many points
+                hidden: false,
+                created_at: None,
+            };
+
+            match state.config_db.create_waypoint(&waypoint) {
+                Ok(id) => {
+                    waypoint_ids.push(id);
+                    result.waypoints_imported += 1;
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to create waypoint for track: {}", e));
+                }
+            }
+        }
+
+        // Create the route from track
+        if !waypoint_ids.is_empty() {
+            let route = Route {
+                id: None,
+                name: track_name.clone(),
+                description: trk.desc,
+                color: Some("#3b82f6".to_string()), // Blue for tracks
+                is_active: false,
+                hidden: false,
+                total_distance_nm: None,
+                estimated_speed_kn: 5.0,
+                created_at: None,
+                updated_at: None,
+            };
+
+            match state.config_db.create_route(&route, &waypoint_ids, &[]) {
+                Ok(_) => result.tracks_imported += 1,
+                Err(e) => result.errors.push(format!("Failed to create route from track '{}': {}", track_name, e)),
+            }
+        }
+    }
+
+    CommandResult::ok(result)
+}
+
+/// Export a single route to a GPX file
+#[tauri::command]
+pub fn export_route_gpx(route_id: i64, file_path: String, state: State<AppState>) -> CommandResult<()> {
+    // Get the route with waypoints
+    let route_with_waypoints = match state.config_db.get_route(route_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return CommandResult::err("Route not found"),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    // Convert to GPX route
+    let gpx_route = GpxRoute {
+        name: Some(route_with_waypoints.route.name.clone()),
+        desc: route_with_waypoints.route.description.clone(),
+        points: route_with_waypoints.waypoints.iter().map(|wp| GpxRoutePoint {
+            name: Some(wp.name.clone()),
+            lat: wp.lat,
+            lon: wp.lon,
+            ele: None,
+            time: None,
+            desc: wp.description.clone(),
+            sym: wp.symbol.clone(),
+        }).collect(),
+    };
+
+    // Generate GPX XML
+    let gpx_xml = match gpx::generate_route_gpx(gpx_route) {
+        Ok(xml) => xml,
+        Err(e) => return CommandResult::err(&format!("Failed to generate GPX: {}", e)),
+    };
+
+    // Write to file
+    match std::fs::write(&file_path, gpx_xml) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&format!("Failed to write GPX file: {}", e)),
+    }
+}
+
+/// Export multiple routes to a single GPX file
+#[tauri::command]
+pub fn export_routes_gpx(route_ids: Vec<i64>, file_path: String, state: State<AppState>) -> CommandResult<()> {
+    let mut gpx_routes = Vec::new();
+
+    for route_id in route_ids {
+        let route_with_waypoints = match state.config_db.get_route(route_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+
+        // Add route
+        gpx_routes.push(GpxRoute {
+            name: Some(route_with_waypoints.route.name.clone()),
+            desc: route_with_waypoints.route.description.clone(),
+            points: route_with_waypoints.waypoints.iter().map(|wp| GpxRoutePoint {
+                name: Some(wp.name.clone()),
+                lat: wp.lat,
+                lon: wp.lon,
+                ele: None,
+                time: None,
+                desc: wp.description.clone(),
+                sym: wp.symbol.clone(),
+            }).collect(),
+        });
+    }
+
+    // Generate GPX XML with all routes
+    let gpx_xml = match gpx::generate_gpx(gpx_routes, vec![], Some("VortexNav Export".to_string())) {
+        Ok(xml) => xml,
+        Err(e) => return CommandResult::err(&format!("Failed to generate GPX: {}", e)),
+    };
+
+    // Write to file
+    match std::fs::write(&file_path, gpx_xml) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&format!("Failed to write GPX file: {}", e)),
+    }
+}
+
+/// Get GPX XML string for a route (for clipboard/sharing)
+#[tauri::command]
+pub fn get_route_gpx_string(route_id: i64, state: State<AppState>) -> CommandResult<String> {
+    // Get the route with waypoints
+    let route_with_waypoints = match state.config_db.get_route(route_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return CommandResult::err("Route not found"),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    // Convert to GPX route
+    let gpx_route = GpxRoute {
+        name: Some(route_with_waypoints.route.name.clone()),
+        desc: route_with_waypoints.route.description.clone(),
+        points: route_with_waypoints.waypoints.iter().map(|wp| GpxRoutePoint {
+            name: Some(wp.name.clone()),
+            lat: wp.lat,
+            lon: wp.lon,
+            ele: None,
+            time: None,
+            desc: wp.description.clone(),
+            sym: wp.symbol.clone(),
+        }).collect(),
+    };
+
+    // Generate GPX XML
+    match gpx::generate_route_gpx(gpx_route) {
+        Ok(xml) => CommandResult::ok(xml),
+        Err(e) => CommandResult::err(&format!("Failed to generate GPX: {}", e)),
+    }
+}
+
+/// Get a text summary of a route for sharing
+#[tauri::command]
+pub fn get_route_summary_text(route_id: i64, state: State<AppState>) -> CommandResult<String> {
+    // Get the route with waypoints
+    let route_with_waypoints = match state.config_db.get_route(route_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return CommandResult::err("Route not found"),
+        Err(e) => return CommandResult::err(&e.to_string()),
+    };
+
+    let route = &route_with_waypoints.route;
+    let waypoints = &route_with_waypoints.waypoints;
+
+    // Calculate statistics
+    let stats = calculate_statistics(waypoints, route.estimated_speed_kn);
+
+    // Build waypoint list for summary
+    let waypoint_tuples: Vec<(String, f64, f64)> = waypoints.iter()
+        .map(|wp| (wp.name.clone(), wp.lat, wp.lon))
+        .collect();
+
+    let summary = gpx::generate_route_summary(
+        &route.name,
+        route.description.as_deref(),
+        &waypoint_tuples,
+        stats.total_distance_nm,
+        stats.estimated_time_hours,
+    );
+
+    CommandResult::ok(summary)
 }
 
 // ============ MBTiles Commands ============
@@ -464,6 +1638,48 @@ pub fn save_chart_layer_state(layer_state: ChartLayerStateInput, state: State<Ap
 pub fn get_chart_layer_states(state: State<AppState>) -> CommandResult<Vec<ChartLayerState>> {
     match state.config_db.get_chart_layer_states() {
         Ok(states) => CommandResult::ok(states),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+// Input for saving chart custom metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartCustomMetadataInput {
+    pub chart_id: String,
+    pub custom_name: Option<String>,
+    pub custom_description: Option<String>,
+    pub custom_min_zoom: Option<i32>,
+    pub custom_max_zoom: Option<i32>,
+}
+
+#[tauri::command]
+pub fn save_chart_custom_metadata(metadata: ChartCustomMetadataInput, state: State<AppState>) -> CommandResult<()> {
+    let db_metadata = ChartCustomMetadata {
+        chart_id: metadata.chart_id,
+        custom_name: metadata.custom_name,
+        custom_description: metadata.custom_description,
+        custom_min_zoom: metadata.custom_min_zoom,
+        custom_max_zoom: metadata.custom_max_zoom,
+    };
+
+    match state.config_db.save_chart_custom_metadata(&db_metadata) {
+        Ok(_) => CommandResult::ok(()),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_chart_custom_metadata(chart_id: String, state: State<AppState>) -> CommandResult<Option<ChartCustomMetadata>> {
+    match state.config_db.get_chart_custom_metadata(&chart_id) {
+        Ok(meta) => CommandResult::ok(meta),
+        Err(e) => CommandResult::err(&e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_all_chart_custom_metadata(state: State<AppState>) -> CommandResult<Vec<ChartCustomMetadata>> {
+    match state.config_db.get_all_chart_custom_metadata() {
+        Ok(metadata) => CommandResult::ok(metadata),
         Err(e) => CommandResult::err(&e.to_string()),
     }
 }
