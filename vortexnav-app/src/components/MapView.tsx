@@ -154,6 +154,8 @@ interface MapViewProps {
   // Track display
   tracks?: TrackWithPoints[];
   recordingTrackId?: number | null;
+  // Entitlement-based zoom limit
+  entitlementMaxZoom?: number | null;
 }
 
 // Waypoint symbol icons mapping
@@ -539,6 +541,8 @@ export function MapView({
   // Track props
   tracks = [],
   recordingTrackId,
+  // Entitlement-based zoom limit
+  entitlementMaxZoom,
 }: MapViewProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -806,6 +810,28 @@ export function MapView({
       map.off('style.load', handleStyleLoad);
     };
   }, [basemap, theme, showOpenSeaMap, apiKeys.esri, mapLoaded]);
+
+  // Enforce entitlement-based max zoom level
+  useEffect(() => {
+    if (!mapRef.current) return;
+
+    const map = mapRef.current;
+    const effectiveMaxZoom = entitlementMaxZoom ?? 20; // Default to 20 if no restriction
+
+    // Update map's max zoom
+    map.setMaxZoom(effectiveMaxZoom);
+
+    // If current zoom exceeds the new limit, zoom out to the limit
+    const currentZoom = map.getZoom();
+    if (currentZoom > effectiveMaxZoom) {
+      map.easeTo({
+        zoom: effectiveMaxZoom,
+        duration: 300,
+      });
+    }
+
+    console.info(`[MapView] Max zoom set to ${effectiveMaxZoom} (entitlement-based)`);
+  }, [entitlementMaxZoom]);
 
   // Track active chart layer IDs for cleanup
   const activeChartLayerIdsRef = useRef<Set<string>>(new Set());

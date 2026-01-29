@@ -57,6 +57,42 @@ function LayerGroup({
   );
 }
 
+// Map LA basemap entitlement keys to BASEMAP_OPTIONS ids
+// LA grants keys like 'osm', 'sentinel', 'esri' which map to multiple basemap options
+const LA_BASEMAP_TO_OPTIONS: Record<string, BasemapProvider[]> = {
+  'osm': ['osm', 'opentopomap'],
+  'sentinel': ['sentinel-2'],
+  'esri': ['esri-satellite', 'esri-ocean'],
+  // These are "free" options that are typically allowed for all plans:
+  'google': ['google-satellite-free', 'google-hybrid-free'],
+  'bing': ['bing-satellite'],
+  'mapbox': ['mapbox-satellite'],
+  'here': ['here-satellite'],
+};
+
+// Get list of allowed basemap IDs from LA entitlement keys
+function getAllowedBasemapIds(laKeys: string[] | null): Set<BasemapProvider> {
+  const allowed = new Set<BasemapProvider>();
+
+  // 'none' is always allowed
+  allowed.add('none');
+
+  if (!laKeys || laKeys.length === 0) {
+    // No restrictions - allow all
+    BASEMAP_OPTIONS.forEach(opt => allowed.add(opt.id));
+    return allowed;
+  }
+
+  for (const key of laKeys) {
+    const mappedOptions = LA_BASEMAP_TO_OPTIONS[key];
+    if (mappedOptions) {
+      mappedOptions.forEach(opt => allowed.add(opt));
+    }
+  }
+
+  return allowed;
+}
+
 // ============ LayerSwitcher Props ============
 interface LayerSwitcherProps {
   theme: ThemeMode;
@@ -65,6 +101,8 @@ interface LayerSwitcherProps {
   apiKeys: ApiKeys;
   chartLayers: ChartLayer[];
   chartLayersLoading: boolean;
+  // Entitlement-based restrictions
+  allowedBasemaps?: string[] | null;  // LA basemap keys like ['osm', 'sentinel', 'esri']
   // GEBCO bathymetry
   gebcoSettings?: GebcoSettings;
   gebcoStatus?: GebcoStatus;
@@ -101,6 +139,7 @@ export function LayerSwitcher({
   apiKeys,
   chartLayers,
   chartLayersLoading,
+  allowedBasemaps,
   gebcoSettings,
   gebcoStatus,
   nauticalSettings = DEFAULT_NAUTICAL_SETTINGS,
@@ -269,10 +308,29 @@ export function LayerSwitcher({
     setShowSettings(false);
   };
 
+  // Get set of entitlement-allowed basemap IDs
+  const allowedBasemapIds = useMemo(
+    () => getAllowedBasemapIds(allowedBasemaps ?? null),
+    [allowedBasemaps]
+  );
+
+  // Check if basemap is available (both API key and entitlement)
   const isBasemapAvailable = (option: typeof BASEMAP_OPTIONS[0]): boolean => {
-    if (!option.requiresApiKey) return true;
-    if (option.requiresApiKey === 'esri') return !!apiKeys.esri;
+    // Check API key requirement
+    if (option.requiresApiKey === 'esri' && !apiKeys.esri) return false;
+
+    // Check entitlement - if allowedBasemaps is provided, enforce it
+    if (allowedBasemaps && allowedBasemaps.length > 0) {
+      return allowedBasemapIds.has(option.id);
+    }
+
     return true;
+  };
+
+  // Check if basemap is blocked by entitlement (different from missing API key)
+  const isBlockedByEntitlement = (option: typeof BASEMAP_OPTIONS[0]): boolean => {
+    if (!allowedBasemaps || allowedBasemaps.length === 0) return false;
+    return !allowedBasemapIds.has(option.id);
   };
 
   const hasApiKeyOptions = BASEMAP_OPTIONS.some(opt => opt.requiresApiKey);
@@ -320,7 +378,13 @@ export function LayerSwitcher({
               <div className="layer-panel__basemaps">
                 {BASEMAP_OPTIONS.map((option) => {
                   const available = isBasemapAvailable(option);
-                  const needsKey = option.requiresApiKey && !available;
+                  const blockedByEntitlement = isBlockedByEntitlement(option);
+                  const needsKey = option.requiresApiKey && !blockedByEntitlement && !apiKeys[option.requiresApiKey as keyof ApiKeys];
+
+                  // Skip blocked basemaps entirely to hide them from the UI
+                  if (blockedByEntitlement) {
+                    return null;
+                  }
 
                   return (
                     <button

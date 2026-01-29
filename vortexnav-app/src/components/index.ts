@@ -17,3 +17,6 @@ export { RouteNavigationModal } from './RouteNavigationModal';
 export { ShareRouteModal } from './ShareRouteModal';
 export { TrackPanel } from './TrackPanel';
 export { ShareTrackModal } from './ShareTrackModal';
+export { DeviceRegistration } from './DeviceRegistration';
+export { DeviceStatusIndicator } from './DeviceStatusIndicator';
+export { PackManager } from './PackManager';

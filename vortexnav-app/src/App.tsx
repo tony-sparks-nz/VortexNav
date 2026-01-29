@@ -1,6 +1,6 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import maplibregl, { LngLatBounds } from 'maplibre-gl';
-import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel, RoutePanel, RouteCreationOverlay, ChartBar, ImportProgressIndicator, NavigationModal, RouteNavigationModal, TrackPanel } from './components';
+import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel, RoutePanel, RouteCreationOverlay, ChartBar, ImportProgressIndicator, NavigationModal, RouteNavigationModal, TrackPanel, DeviceRegistration, PackManager } from './components';
 import type { ThemeMode, Vessel, BasemapProvider, ApiKeys, ImportProgress, GebcoSettings, GebcoStatus, Cm93Settings, Cm93Status, GeoJsonTile, NauticalChartSettings, NauticalChartStatus } from './types';
 import { DEFAULT_GEBCO_SETTINGS, DEFAULT_CM93_SETTINGS, TRACK_RECORDING_INTERVAL, TRACK_MIN_MOVEMENT_METERS } from './types';
 import {
@@ -26,6 +26,8 @@ import { useWaypointManager } from './hooks/useWaypointManager';
 import { useRouteManager } from './hooks/useRouteManager';
 import { useTrackManager } from './hooks/useTrackManager';
 import { useChartLayers } from './hooks/useChartLayers';
+import { useLicensingAgent } from './hooks/useLicensingAgent';
+import { registerVortexProtocol } from './utils/vortexProtocol';
 import './App.css';
 
 function App() {
@@ -55,6 +57,10 @@ function App() {
   const [showGpsStatus, setShowGpsStatus] = useState(false);
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const [gpsStatus, setGpsStatus] = useState<GpsSourceStatus | null>(null);
+
+  // Licensing Agent panels
+  const [showDeviceRegistration, setShowDeviceRegistration] = useState(false);
+  const [showPackManager, setShowPackManager] = useState(false);
 
   // Map orientation mode: 'north-up' or 'heading-up'
   const [orientationMode, setOrientationMode] = useState<'north-up' | 'heading-up'>('north-up');
@@ -86,6 +92,27 @@ function App() {
   // ============ CENTRALIZED TRACK STATE ============
   // All track state is managed by useTrackManager
   const trackManager = useTrackManager();
+
+  // ============ LICENSING AGENT STATE ============
+  // Device registration, entitlements, and offline packs
+  const licensingAgent = useLicensingAgent();
+
+  // Extract entitlement values for UI enforcement
+  const entitlementMaxZoom = useMemo(() => {
+    const ent = licensingAgent.entitlements.find(e => e.key === 'max_zoom_level');
+    if (ent && typeof ent.value === 'number') {
+      return ent.value;
+    }
+    return null; // No restriction (default to map's default maxZoom)
+  }, [licensingAgent.entitlements]);
+
+  const allowedBasemaps = useMemo(() => {
+    const ent = licensingAgent.entitlements.find(e => e.key === 'allowed_basemaps');
+    if (ent && Array.isArray(ent.value)) {
+      return ent.value as string[];
+    }
+    return null; // No restriction
+  }, [licensingAgent.entitlements]);
 
   // Route navigation state - tracks current waypoint when navigating a route
   const [currentRouteWaypointIndex, setCurrentRouteWaypointIndex] = useState(0);
@@ -162,6 +189,19 @@ function App() {
   // Chart outline display state
   const [showChartOutlines, setShowChartOutlines] = useState(false);
   const [highlightedChartId, setHighlightedChartId] = useState<string | null>(null);
+
+  // Register vortex:// protocol for LA tile serving
+  useEffect(() => {
+    registerVortexProtocol();
+  }, []);
+
+  // Show device registration modal on first run if not registered
+  useEffect(() => {
+    if (settingsLoaded && licensingAgent.isConnected && !licensingAgent.isRegistered && !licensingAgent.isLoading) {
+      // Device is connected to LA but not registered - show registration modal
+      setShowDeviceRegistration(true);
+    }
+  }, [settingsLoaded, licensingAgent.isConnected, licensingAgent.isRegistered, licensingAgent.isLoading]);
 
   // Load settings from backend on startup
   useEffect(() => {
@@ -808,6 +848,8 @@ function App() {
           // Track props
           tracks={trackManager.visibleTracksWithPoints}
           recordingTrackId={trackManager.state.recording.trackId}
+          // Entitlement-based restrictions
+          entitlementMaxZoom={entitlementMaxZoom}
         />
 
         {/* Layers Button - top left, second in stack */}
@@ -935,8 +977,15 @@ function App() {
           cursorPosition={cursorPosition}
           activeWaypoint={activeWaypoint}
           currentZoom={currentZoom}
+          laStatus={{
+            isConnected: licensingAgent.isConnected,
+            isRegistered: licensingAgent.isRegistered,
+            packsCount: licensingAgent.packs.filter(p => p.status === 'ready').length,
+          }}
           onThemeChange={handleThemeChange}
           onGpsStatusClick={() => setShowGpsStatus(true)}
+          onLaStatusClick={() => setShowDeviceRegistration(true)}
+          onPacksClick={() => setShowPackManager(true)}
         />
       </footer>
 
@@ -1070,6 +1119,7 @@ function App() {
           apiKeys={apiKeys}
           chartLayers={chartLayers}
           chartLayersLoading={chartLayersLoading}
+          allowedBasemaps={allowedBasemaps}
           gebcoSettings={gebcoSettings}
           gebcoStatus={gebcoStatus ?? undefined}
           nauticalSettings={nauticalSettings}
@@ -1099,6 +1149,26 @@ function App() {
           theme={theme}
           onExpand={() => setShowLayerPanel(true)}
           onDismiss={() => setBackgroundImportProgress(null)}
+        />
+      )}
+
+      {/* Device Registration Modal */}
+      {showDeviceRegistration && (
+        <DeviceRegistration
+          theme={theme}
+          onClose={() => setShowDeviceRegistration(false)}
+          onRegistered={() => {
+            setShowDeviceRegistration(false);
+            // Optionally show pack manager after registration
+          }}
+        />
+      )}
+
+      {/* Offline Pack Manager */}
+      {showPackManager && (
+        <PackManager
+          theme={theme}
+          onClose={() => setShowPackManager(false)}
         />
       )}
     </div>

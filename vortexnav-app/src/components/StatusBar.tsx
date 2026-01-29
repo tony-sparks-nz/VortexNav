@@ -1,6 +1,13 @@
 import type { Vessel, ThemeMode } from '../types';
 import type { GpsSourceStatus, Waypoint } from '../hooks/useTauri';
 import { calculateDistance, calculateBearing, formatDistance, formatBearing } from '../hooks/useTauri';
+import { DeviceStatusIndicator } from './DeviceStatusIndicator';
+
+interface LaStatus {
+  isConnected: boolean;
+  isRegistered: boolean;
+  packsCount?: number;
+}
 
 interface StatusBarProps {
   vessel: Vessel;
@@ -10,8 +17,11 @@ interface StatusBarProps {
   cursorPosition?: { lat: number; lon: number } | null;
   activeWaypoint?: Waypoint | null;
   currentZoom?: number;
+  laStatus?: LaStatus;
   onThemeChange: (theme: ThemeMode) => void;
   onGpsStatusClick?: () => void;
+  onLaStatusClick?: () => void;
+  onPacksClick?: () => void;
 }
 
 function formatCoordinate(value: number | null, type: 'lat' | 'lon'): string {
@@ -104,8 +114,11 @@ export function StatusBar({
   cursorPosition,
   activeWaypoint,
   currentZoom,
+  laStatus: _laStatus,
   onThemeChange,
   onGpsStatusClick,
+  onLaStatusClick: _onLaStatusClick,
+  onPacksClick: _onPacksClick,
 }: StatusBarProps) {
   const themeOptions: ThemeMode[] = ['day', 'dusk', 'night'];
 
@@ -218,6 +231,9 @@ export function StatusBar({
       )}
 
       <div className="status-bar__section status-bar__controls">
+        {/* Device Status Indicator with glowing button */}
+        <DeviceStatusIndicator theme={theme} />
+
         <button
           className="status-bar__gps-btn status-bar__gps-btn--icon"
           onClick={onGpsStatusClick}

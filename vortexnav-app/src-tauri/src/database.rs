@@ -2168,21 +2168,28 @@ impl MBTilesReader {
 
         match fallback_z {
             Some(parent_z) => {
-                // Calculate the parent tile coordinates
-                // Each zoom level decrease halves the tile coordinates
-                let z_diff = z - parent_z;
-                let parent_x = x >> z_diff;
-                let parent_y = y >> z_diff;
-                let parent_tms_y = (1 << parent_z) - 1 - parent_y;
+                // Calculate the fallback tile coordinates
+                // Handle both downscaling (parent_z < z) and upscaling (parent_z > z)
+                let (fallback_x, fallback_y) = if parent_z < z {
+                    // Downscale: parent tile covers larger area, right-shift coordinates
+                    let z_diff = z - parent_z;
+                    (x >> z_diff, y >> z_diff)
+                } else {
+                    // Upscale: child tile covers smaller area, left-shift coordinates
+                    // Pick the top-left child tile that contains our area
+                    let z_diff = parent_z - z;
+                    (x << z_diff, y << z_diff)
+                };
+                let fallback_tms_y = (1u32 << parent_z).saturating_sub(1).saturating_sub(fallback_y);
 
                 println!("MBTiles: Tile z{}/x{}/y{} missing, using fallback z{}/x{}/y{}",
-                    z, x, y, parent_z, parent_x, parent_y);
+                    z, x, y, parent_z, fallback_x, fallback_y);
 
                 let mut stmt = self.conn.prepare(
                     "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
                 )?;
 
-                stmt.query_row(params![parent_z, parent_x, parent_tms_y], |row| row.get(0))
+                stmt.query_row(params![parent_z, fallback_x, fallback_tms_y], |row| row.get(0))
                     .map_err(|_| DatabaseError::TileNotFound { z, x, y })
             }
             None => Err(DatabaseError::TileNotFound { z, x, y })

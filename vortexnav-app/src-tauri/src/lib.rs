@@ -9,6 +9,7 @@ mod database;
 mod download_manager;
 mod gps;
 mod gpx;
+mod licensing;
 mod nmea;
 
 use commands::AppState;
@@ -169,6 +170,19 @@ pub fn run() {
             commands::recalculate_chart_bounds_from_tiles,
             // Utilities
             commands::get_app_data_dir,
+            // Licensing Agent
+            licensing::la_check_connection,
+            licensing::la_get_device_status,
+            licensing::la_register_device,
+            licensing::la_sync,
+            licensing::la_check_entitlement,
+            licensing::la_list_entitlements,
+            licensing::la_list_packs,
+            licensing::la_get_pack_catalog,
+            licensing::la_request_pack,
+            licensing::la_get_pack_status,
+            licensing::la_delete_pack,
+            licensing::la_get_tile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
