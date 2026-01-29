@@ -977,6 +977,7 @@ function App() {
           cursorPosition={cursorPosition}
           activeWaypoint={activeWaypoint}
           currentZoom={currentZoom}
+          entitlementMaxZoom={entitlementMaxZoom}
           laStatus={{
             isConnected: licensingAgent.isConnected,
             isRegistered: licensingAgent.isRegistered,

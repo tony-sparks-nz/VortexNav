@@ -284,6 +284,31 @@ export function useChartLayers(): UseChartLayersReturn {
       // Sort by zOrder
       chartLayers.sort((a, b) => a.zOrder - b.zOrder);
 
+      // SINGLE-SELECT ENFORCEMENT: Ensure only one chart is enabled at load time
+      // If multiple are enabled from saved state, keep only the first one enabled
+      const enabledCharts = chartLayers.filter(l => l.enabled);
+      if (enabledCharts.length > 1) {
+        console.info(`[useChartLayers] Multiple charts enabled (${enabledCharts.length}), enforcing single-select`);
+        // Keep only the first enabled chart, disable the rest
+        let foundFirst = false;
+        for (const layer of chartLayers) {
+          if (layer.enabled) {
+            if (!foundFirst) {
+              foundFirst = true;
+            } else {
+              layer.enabled = false;
+              // Also save the disabled state to backend
+              saveChartLayerState({
+                chartId: layer.chartId,
+                enabled: false,
+                opacity: layer.opacity,
+                zOrder: layer.zOrder,
+              }).catch(err => console.error('Failed to save disabled state:', err));
+            }
+          }
+        }
+      }
+
       setLayers(chartLayers);
     } catch (err) {
       console.error('Failed to load chart layers:', err);
@@ -359,7 +384,7 @@ export function useChartLayers(): UseChartLayersReturn {
     }
   }, [refreshLayers]);
 
-  // Toggle layer visibility
+  // Toggle layer visibility (single-select: only one chart visible at a time)
   const toggleLayer = useCallback(async (chartId: string) => {
     if (!isTauri()) return;
 
@@ -367,20 +392,44 @@ export function useChartLayers(): UseChartLayersReturn {
       const layer = layers.find(l => l.chartId === chartId);
       if (!layer) return;
 
+      // If clicking on already-enabled chart, just disable it
+      // If clicking on disabled chart, enable it and disable all others
       const newEnabled = !layer.enabled;
 
       // Update local state immediately for responsiveness
-      setLayers(prev => prev.map(l =>
-        l.chartId === chartId ? { ...l, enabled: newEnabled } : l
-      ));
+      // Single-select: when enabling a chart, disable all others
+      setLayers(prev => prev.map(l => {
+        if (l.chartId === chartId) {
+          return { ...l, enabled: newEnabled };
+        }
+        // If we're enabling a chart, disable all others
+        if (newEnabled && l.enabled) {
+          return { ...l, enabled: false };
+        }
+        return l;
+      }));
 
-      // Save to backend
+      // Save to backend - save the toggled chart
       await saveChartLayerState({
         chartId,
         enabled: newEnabled,
         opacity: layer.opacity,
         zOrder: layer.zOrder,
       });
+
+      // If enabling this chart, also save disabled state for others
+      if (newEnabled) {
+        for (const otherLayer of layers) {
+          if (otherLayer.chartId !== chartId && otherLayer.enabled) {
+            await saveChartLayerState({
+              chartId: otherLayer.chartId,
+              enabled: false,
+              opacity: otherLayer.opacity,
+              zOrder: otherLayer.zOrder,
+            });
+          }
+        }
+      }
     } catch (err) {
       console.error('Failed to toggle layer:', err);
       // Revert on error

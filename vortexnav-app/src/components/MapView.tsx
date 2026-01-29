@@ -854,11 +854,21 @@ export function MapView({
       return;
     }
 
-    console.debug('MapView: Processing chart layers', {
+    const enabledCharts = chartLayers.filter(l => l.enabled);
+    console.info('MapView: Processing chart layers', {
       count: chartLayers.length,
       styleVersion,
-      enabledLayers: chartLayers.filter(l => l.enabled).map(l => l.chartId)
+      enabledCount: enabledCharts.length,
+      enabledLayers: enabledCharts.map(l => l.chartId),
+      allChartsHidden,
     });
+
+    // SINGLE-SELECT SAFETY: If multiple charts are enabled, log a warning
+    // (This should not happen if useChartLayers is working correctly)
+    if (enabledCharts.length > 1) {
+      console.warn('MapView: Multiple charts enabled! Single-select may not be working.',
+        enabledCharts.map(l => l.chartId));
+    }
 
     const currentLayerIds = activeChartLayerIdsRef.current;
     const newLayerIds = new Set<string>();
@@ -904,7 +914,7 @@ export function MapView({
               });
             }
 
-            // Build source config
+            // Build source config - ALWAYS set bounds to constrain tile requests
             const sourceConfig: maplibregl.RasterSourceSpecification = {
               type: 'raster',
               tiles: [`mbtiles://${layer.chartId}/{z}/{x}/{y}`],
@@ -913,14 +923,21 @@ export function MapView({
               maxzoom: sourceMaxZoom,
             };
 
-            // For antimeridian charts, set explicit bounds to help MapLibre position tiles correctly
-            // The bounds crossing the dateline (west > east when both positive, or using values > 180)
+            // Set bounds on ALL sources to constrain tile requests to the chart's geographic extent
+            // This prevents MapLibre from requesting tiles outside the chart area
             if (isAntimeridianChart && layer.zoomBounds) {
+              // For antimeridian charts, use special bounds that span the dateline
               const [, south, , north] = layer.zoomBounds;
-              // Bounds that span the antimeridian: 170°E to 190°E (which is -170°W)
-              // This tells MapLibre the source covers the dateline region
               sourceConfig.bounds = [170, south, 190, north];
               console.info(`MapView: Antimeridian bounds for ${layer.chartId}:`, sourceConfig.bounds);
+            } else if (layer.bounds) {
+              // For normal charts, use their geographic bounds
+              sourceConfig.bounds = layer.bounds;
+              console.info(`MapView: Setting bounds for ${layer.chartId}:`, sourceConfig.bounds);
+            } else if (layer.zoomBounds) {
+              // Fallback to zoomBounds if bounds not available
+              sourceConfig.bounds = layer.zoomBounds;
+              console.info(`MapView: Using zoomBounds for ${layer.chartId}:`, sourceConfig.bounds);
             }
 
             console.info(`MapView: Source config for ${layer.chartId}:`, JSON.stringify(sourceConfig));
