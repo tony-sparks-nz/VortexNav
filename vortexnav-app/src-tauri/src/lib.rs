@@ -174,6 +174,7 @@ pub fn run() {
             licensing::la_check_connection,
             licensing::la_get_device_status,
             licensing::la_register_device,
+            licensing::la_reset_device,
             licensing::la_sync,
             licensing::la_check_entitlement,
             licensing::la_list_entitlements,
@@ -183,6 +184,13 @@ pub fn run() {
             licensing::la_get_pack_status,
             licensing::la_delete_pack,
             licensing::la_get_tile,
+            licensing::la_request_custom_pack,
+            licensing::la_estimate_pack_tiles,
+            licensing::la_get_download_progress,
+            licensing::la_pause_download,
+            licensing::la_resume_download,
+            licensing::la_cancel_download,
+            licensing::la_export_pack,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

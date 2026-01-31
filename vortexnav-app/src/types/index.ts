@@ -61,6 +61,9 @@ export interface BasemapOption {
   description: string;
   requiresApiKey?: 'esri' | 'mapbox' | 'here';
   offline: boolean;
+  /** Whether this basemap can be downloaded for offline use.
+   * Some providers (Google, Bing) prohibit tile caching in their ToS. */
+  downloadable: boolean;
 }
 
 export const BASEMAP_OPTIONS: BasemapOption[] = [
@@ -69,30 +72,35 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     name: 'None',
     description: 'No basemap - show only chart layers',
     offline: true,
+    downloadable: false,
   },
   {
     id: 'osm',
     name: 'OpenStreetMap',
     description: 'Standard street map',
     offline: true,
+    downloadable: true,
   },
   {
     id: 'opentopomap',
     name: 'OpenTopoMap',
     description: 'Topographic map with terrain',
     offline: true,
+    downloadable: true,
   },
   {
     id: 'google-satellite-free',
     name: 'Google Satellite',
     description: 'Satellite imagery (no API key required)',
     offline: false,
+    downloadable: false, // Google ToS prohibits tile caching
   },
   {
     id: 'google-hybrid-free',
     name: 'Google Hybrid',
     description: 'Satellite with labels (no API key required)',
     offline: false,
+    downloadable: false, // Google ToS prohibits tile caching
   },
   {
     id: 'esri-satellite',
@@ -100,6 +108,7 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     description: 'High-resolution satellite (requires API key)',
     requiresApiKey: 'esri',
     offline: false,
+    downloadable: true,
   },
   {
     id: 'esri-ocean',
@@ -107,18 +116,21 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     description: 'Ocean-focused with bathymetry (requires API key)',
     requiresApiKey: 'esri',
     offline: false,
+    downloadable: true,
   },
   {
     id: 'sentinel-2',
     name: 'Sentinel-2 Cloudless',
     description: 'ESA Sentinel-2 satellite mosaic (10m resolution)',
     offline: false,
+    downloadable: true,
   },
   {
     id: 'bing-satellite',
     name: 'Bing Satellite',
     description: 'Microsoft Bing aerial imagery',
     offline: false,
+    downloadable: false, // Bing ToS prohibits tile caching
   },
   {
     id: 'mapbox-satellite',
@@ -126,6 +138,7 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     description: 'High-resolution satellite (requires API key)',
     requiresApiKey: 'mapbox',
     offline: false,
+    downloadable: false, // Mapbox ToS restricts offline caching
   },
   {
     id: 'here-satellite',
@@ -133,8 +146,18 @@ export const BASEMAP_OPTIONS: BasemapOption[] = [
     description: 'HERE aerial imagery (requires API key)',
     requiresApiKey: 'here',
     offline: false,
+    downloadable: false, // HERE ToS restricts offline caching
   },
 ];
+
+/** Get basemaps that can be downloaded for offline use */
+export const DOWNLOADABLE_BASEMAPS = BASEMAP_OPTIONS.filter(b => b.downloadable);
+
+/** Check if a basemap can be downloaded for offline use */
+export function isBasemapDownloadable(basemapId: BasemapProvider): boolean {
+  const basemap = BASEMAP_OPTIONS.find(b => b.id === basemapId);
+  return basemap?.downloadable ?? false;
+}
 
 // MBTiles metadata from backend
 export interface MBTilesMetadata {
@@ -808,3 +831,72 @@ export const TRACK_RECORDING_INTERVAL = 5000;
 
 // Minimum movement in meters before recording a new point
 export const TRACK_MIN_MOVEMENT_METERS = 5;
+
+// ============ Download Area (Offline Pack) Types ============
+
+// Area of Interest bounds for offline downloads
+export interface AOIBounds {
+  minLon: number;
+  minLat: number;
+  maxLon: number;
+  maxLat: number;
+}
+
+// Polygon point for user-drawn areas
+export interface PolygonPoint {
+  lat: number;
+  lon: number;
+}
+
+// Download area configuration
+export interface DownloadAreaConfig {
+  name: string;
+  bounds: AOIBounds;
+  polygonPoints: PolygonPoint[];
+  minZoom: number;
+  maxZoom: number;
+  basemapId: string;
+}
+
+// Tile estimate returned from backend
+export interface TileEstimate {
+  tileCount: number;
+  estimatedSizeBytes: number;
+}
+
+// Download area state
+export interface DownloadAreaState {
+  isDrawing: boolean;
+  isConfiguring: boolean;
+  polygonPoints: PolygonPoint[];
+  bounds: AOIBounds | null;
+  downloadName: string;
+  minZoom: number;
+  maxZoom: number;
+  estimatedTileCount: number;
+  estimatedSizeBytes: number;
+  isDownloading: boolean;
+  downloadProgress: number;
+  error: string | null;
+}
+
+// Download area edit status
+export type DownloadAreaStatus = 'idle' | 'drawing' | 'configuring' | 'downloading';
+
+// Validation limits for downloads
+export const DOWNLOAD_AREA_LIMITS = {
+  MIN_BOUNDS_DEGREES: 0.001,
+  WARNING_TILE_COUNT: 50000,
+  MAX_TILE_COUNT: 200000,
+  DEFAULT_MIN_ZOOM: 6,
+  DEFAULT_MAX_ZOOM: 14,
+} as const;
+
+// Average tile size estimates by provider (bytes)
+export const TILE_SIZE_ESTIMATES: Record<string, number> = {
+  osm: 25000,
+  'google-satellite-free': 45000,
+  'google-hybrid-free': 50000,
+  'esri-satellite': 40000,
+  default: 30000,
+};

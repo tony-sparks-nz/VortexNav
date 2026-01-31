@@ -6,6 +6,21 @@ import { ChartEditModal } from './ChartEditModal';
 import { CatalogManager } from './CatalogManager';
 import { ChartImportDialog } from './ChartImportDialog';
 import { useCatalogs } from '../hooks/useCatalogs';
+import type { PackInfo, DownloadProgressResult } from '../services/laClient';
+import { formatBytes, daysUntilExpiry, isExpired } from '../services/laClient';
+
+// Format ETA seconds into human readable string
+function formatETA(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+  }
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+}
 
 // ============ LayerGroup Component ============
 interface LayerGroupProps {
@@ -109,6 +124,15 @@ interface LayerSwitcherProps {
   // Nautical Chart (consolidated CM93)
   nauticalSettings?: NauticalChartSettings;
   nauticalStatus?: NauticalChartStatus;
+  // Downloaded offline packs from LA
+  offlinePacks?: PackInfo[];
+  downloadProgress?: Map<string, DownloadProgressResult>;  // Real-time progress for downloading packs
+  onDeletePack?: (packId: string) => void;
+  onZoomToPack?: (packId: string) => void;
+  onExportPack?: (packId: string, packName: string) => void;
+  onPauseDownload?: (packId: string) => void;
+  onResumeDownload?: (packId: string) => void;
+  onCancelDownload?: (packId: string) => void;
   onGebcoSettingsChange?: (settings: GebcoSettings) => void;
   onNauticalSettingsChange?: (settings: NauticalChartSettings) => void;
   onNauticalInitialize?: (path: string) => void;
@@ -144,6 +168,14 @@ export function LayerSwitcher({
   gebcoStatus,
   nauticalSettings = DEFAULT_NAUTICAL_SETTINGS,
   nauticalStatus,
+  offlinePacks = [],
+  downloadProgress,
+  onDeletePack,
+  onZoomToPack,
+  onExportPack,
+  onPauseDownload,
+  onResumeDownload,
+  onCancelDownload,
   onGebcoSettingsChange,
   onNauticalSettingsChange,
   onNauticalInitialize,
@@ -811,6 +843,215 @@ export function LayerSwitcher({
                 <div className="layer-group__empty">No charts match "{nameFilter}"</div>
               )}
             </>
+          )}
+        </LayerGroup>
+
+        {/* ============ DOWNLOADED AREAS GROUP ============ */}
+        <LayerGroup
+          title="Downloaded Areas"
+          badge={offlinePacks.length > 0 ? `(${offlinePacks.filter(p => p.status === 'ready').length})` : undefined}
+          defaultExpanded={false}
+        >
+          {offlinePacks.length === 0 ? (
+            <div className="layer-group__empty">
+              No offline areas downloaded. Use the Download button to save map areas for offline use.
+            </div>
+          ) : (
+            <div className="layer-group__pack-list">
+              {offlinePacks.map((pack) => {
+                const expired = isExpired(pack.expires_at);
+                const daysLeft = daysUntilExpiry(pack.expires_at);
+                const minZoom = pack.zoom_levels ? Math.min(...pack.zoom_levels) : null;
+                const maxZoom = pack.zoom_levels ? Math.max(...pack.zoom_levels) : null;
+                const isDownloading = pack.status === 'downloading';
+                const progress = downloadProgress?.get(pack.id);
+                const isPaused = progress?.paused ?? false;
+
+                return (
+                  <div
+                    key={pack.id}
+                    className={`layer-group__pack-item ${expired ? 'layer-group__pack-item--expired' : ''} ${isDownloading ? 'layer-group__pack-item--downloading' : ''}`}
+                  >
+                    <div className="layer-group__pack-header">
+                      <span className="layer-group__pack-name">{pack.name}</span>
+                      <span className={`layer-group__pack-status layer-group__pack-status--${isPaused ? 'paused' : pack.status}`}>
+                        {isPaused ? 'PAUSED' : pack.status.toUpperCase()}
+                      </span>
+                    </div>
+
+                    <div className="layer-group__pack-details">
+                      {/* Provider/basemap */}
+                      {pack.provider && (
+                        <div className="layer-group__pack-row">
+                          <span className="layer-group__pack-label">Basemap:</span>
+                          <span>{pack.provider}</span>
+                        </div>
+                      )}
+
+                      {/* Zoom levels */}
+                      {minZoom !== null && maxZoom !== null && (
+                        <div className="layer-group__pack-row">
+                          <span className="layer-group__pack-label">Zoom:</span>
+                          <span>{minZoom} - {maxZoom}</span>
+                        </div>
+                      )}
+
+                      {/* Bounds */}
+                      {pack.bounds && (
+                        <div className="layer-group__pack-row">
+                          <span className="layer-group__pack-label">Area:</span>
+                          <span>
+                            {pack.bounds.min_lat.toFixed(3)}° to {pack.bounds.max_lat.toFixed(3)}°N,{' '}
+                            {pack.bounds.min_lon.toFixed(3)}° to {pack.bounds.max_lon.toFixed(3)}°E
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Download progress for downloading packs */}
+                      {isDownloading && progress && (
+                        <>
+                          <div className="layer-group__pack-row">
+                            <span className="layer-group__pack-label">Progress:</span>
+                            <span className="layer-group__pack-progress-text">
+                              {progress.downloaded_tiles.toLocaleString()}/{progress.total_tiles.toLocaleString()} tiles
+                              ({progress.percent.toFixed(1)}%)
+                            </span>
+                          </div>
+                          <div className="layer-group__pack-progress-bar">
+                            <div
+                              className={`layer-group__pack-progress-fill ${isPaused ? 'layer-group__pack-progress-fill--paused' : ''}`}
+                              style={{ width: `${progress.percent}%` }}
+                            />
+                          </div>
+                          {!isPaused && progress.tiles_per_second != null && progress.tiles_per_second > 0 && (
+                            <div className="layer-group__pack-row">
+                              <span className="layer-group__pack-label">Speed:</span>
+                              <span>{progress.tiles_per_second.toFixed(1)} tiles/s</span>
+                            </div>
+                          )}
+                          {!isPaused && progress.eta_seconds != null && progress.eta_seconds > 0 && (
+                            <div className="layer-group__pack-row">
+                              <span className="layer-group__pack-label">ETA:</span>
+                              <span>{formatETA(progress.eta_seconds)}</span>
+                            </div>
+                          )}
+                        </>
+                      )}
+
+                      {/* Tile count and size for non-downloading packs */}
+                      {!isDownloading && (
+                        <div className="layer-group__pack-row">
+                          <span className="layer-group__pack-label">Size:</span>
+                          <span>
+                            {pack.tile_count?.toLocaleString() ?? '?'} tiles
+                            {pack.size_bytes && ` (${formatBytes(pack.size_bytes)})`}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Downloaded date */}
+                      {pack.downloaded_at && (
+                        <div className="layer-group__pack-row">
+                          <span className="layer-group__pack-label">Downloaded:</span>
+                          <span>{new Date(pack.downloaded_at).toLocaleDateString()}</span>
+                        </div>
+                      )}
+
+                      {/* Expiry */}
+                      <div className="layer-group__pack-row">
+                        <span className="layer-group__pack-label">Expires:</span>
+                        <span className={expired ? 'layer-group__pack-expired' : daysLeft <= 7 ? 'layer-group__pack-expiring' : ''}>
+                          {expired
+                            ? 'Expired'
+                            : daysLeft <= 7
+                              ? `${daysLeft} day${daysLeft !== 1 ? 's' : ''}`
+                              : new Date(pack.expires_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="layer-group__pack-actions">
+                      {/* Download control buttons */}
+                      {isDownloading && (
+                        <>
+                          {isPaused ? (
+                            onResumeDownload && (
+                              <button
+                                className="layer-group__pack-btn layer-group__pack-btn--resume"
+                                onClick={() => onResumeDownload(pack.id)}
+                                title="Resume download"
+                              >
+                                Resume
+                              </button>
+                            )
+                          ) : (
+                            onPauseDownload && (
+                              <button
+                                className="layer-group__pack-btn layer-group__pack-btn--pause"
+                                onClick={() => onPauseDownload(pack.id)}
+                                title="Pause download"
+                              >
+                                Pause
+                              </button>
+                            )
+                          )}
+                          {onCancelDownload && (
+                            <button
+                              className="layer-group__pack-btn layer-group__pack-btn--danger"
+                              onClick={() => {
+                                if (window.confirm(`Cancel downloading "${pack.name}"? Progress will be saved and can be resumed later.`)) {
+                                  onCancelDownload(pack.id);
+                                }
+                              }}
+                              title="Cancel download"
+                            >
+                              Cancel
+                            </button>
+                          )}
+                        </>
+                      )}
+
+                      {/* Zoom button */}
+                      {pack.bounds && onZoomToPack && (
+                        <button
+                          className="layer-group__pack-btn"
+                          onClick={() => onZoomToPack(pack.id)}
+                          title="Zoom to area"
+                        >
+                          Zoom
+                        </button>
+                      )}
+
+                      {/* Export button (ready packs only) */}
+                      {pack.status === 'ready' && onExportPack && (
+                        <button
+                          className="layer-group__pack-btn"
+                          onClick={() => onExportPack(pack.id, pack.name)}
+                          title="Export MBTiles file"
+                        >
+                          Export
+                        </button>
+                      )}
+
+                      {/* Delete button (ready packs only) */}
+                      {pack.status === 'ready' && onDeletePack && (
+                        <button
+                          className="layer-group__pack-btn layer-group__pack-btn--danger"
+                          onClick={() => {
+                            if (window.confirm(`Delete "${pack.name}"? You will need to re-download to access this area offline.`)) {
+                              onDeletePack(pack.id);
+                            }
+                          }}
+                          title="Delete pack"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </LayerGroup>
       </div>

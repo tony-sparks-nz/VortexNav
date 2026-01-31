@@ -8,7 +8,18 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import * as laClient from '../services/laClient';
-import type { DeviceStatus, PackInfo, PackCatalogRegion, Entitlement } from '../services/laClient';
+import type {
+  DeviceStatus,
+  PackInfo,
+  PackCatalogRegion,
+  Entitlement,
+  CustomPackBounds,
+  CustomPackResult,
+  TileEstimateResult,
+  DownloadProgressResult,
+  PauseResumeResult,
+  CancelResult,
+} from '../services/laClient';
 
 export interface LaConnectionState {
   isConnected: boolean;
@@ -36,6 +47,24 @@ export interface UseLicensingAgentReturn extends LaConnectionState {
   refreshCatalog: () => Promise<void>;
   requestPack: (regionSlug: string, zoomLevels?: number[]) => Promise<string | null>;
   deletePack: (packId: string) => Promise<boolean>;
+
+  // Custom pack (download area) operations
+  requestCustomPack: (
+    bounds: CustomPackBounds,
+    zoomLevels: number[],
+    basemapId: string,
+    name: string
+  ) => Promise<CustomPackResult | null>;
+  estimatePackTiles: (
+    bounds: CustomPackBounds,
+    zoomLevels: number[]
+  ) => Promise<TileEstimateResult | null>;
+  getDownloadProgress: (packId: string) => Promise<DownloadProgressResult | null>;
+
+  // Download control
+  pauseDownload: (packId: string) => Promise<boolean>;
+  resumeDownload: (packId: string) => Promise<boolean>;
+  cancelDownload: (packId: string) => Promise<boolean>;
 }
 
 /**
@@ -160,6 +189,13 @@ export function useLicensingAgent(): UseLicensingAgentReturn {
   const refreshEntitlements = useCallback(async (): Promise<void> => {
     try {
       const entitlementList = await laClient.listEntitlements();
+      console.log('[useLicensingAgent] Received entitlements:', JSON.stringify(entitlementList, null, 2));
+      // Log specific max_zoom_level entitlement for debugging
+      const maxZoomEnt = entitlementList.find(e => e.key === 'max_zoom_level');
+      console.log('[useLicensingAgent] max_zoom_level entitlement:', maxZoomEnt);
+      if (maxZoomEnt) {
+        console.log('[useLicensingAgent] max_zoom_level value type:', typeof maxZoomEnt.value, 'value:', maxZoomEnt.value);
+      }
       setState(prev => ({ ...prev, entitlements: entitlementList }));
     } catch (err) {
       console.error('Failed to refresh entitlements:', err);
@@ -237,6 +273,104 @@ export function useLicensingAgent(): UseLicensingAgentReturn {
     }
   }, [refreshPacks]);
 
+  /**
+   * Request a custom pack download for a user-defined area
+   */
+  const requestCustomPack = useCallback(async (
+    bounds: CustomPackBounds,
+    zoomLevels: number[],
+    basemapId: string,
+    name: string
+  ): Promise<CustomPackResult | null> => {
+    console.log('[useLicensingAgent] requestCustomPack called:', { bounds, zoomLevels, basemapId, name });
+    console.log('[useLicensingAgent] Connection state:', { isConnected: state.isConnected, isRegistered: state.isRegistered });
+
+    try {
+      const result = await laClient.requestCustomPack(bounds, zoomLevels, basemapId, name);
+      console.log('[useLicensingAgent] requestCustomPack result:', result);
+      // Refresh packs to show the new pending pack
+      await refreshPacks();
+      return result;
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('[useLicensingAgent] requestCustomPack FAILED:', errorMsg, err);
+      // Re-throw so caller can handle the specific error
+      throw new Error(`Custom pack request failed: ${errorMsg}`);
+    }
+  }, [refreshPacks, state.isConnected, state.isRegistered]);
+
+  /**
+   * Estimate tile count and size for a custom area
+   */
+  const estimatePackTiles = useCallback(async (
+    bounds: CustomPackBounds,
+    zoomLevels: number[]
+  ): Promise<TileEstimateResult | null> => {
+    try {
+      return await laClient.estimatePackTiles(bounds, zoomLevels);
+    } catch (err) {
+      console.error('Failed to estimate pack tiles:', err);
+      return null;
+    }
+  }, []);
+
+  /**
+   * Get download progress for a pack
+   */
+  const getDownloadProgress = useCallback(async (
+    packId: string
+  ): Promise<DownloadProgressResult | null> => {
+    try {
+      return await laClient.getDownloadProgress(packId);
+    } catch (err) {
+      console.error('Failed to get download progress:', err);
+      return null;
+    }
+  }, []);
+
+  /**
+   * Pause a download
+   */
+  const pauseDownload = useCallback(async (packId: string): Promise<boolean> => {
+    try {
+      const result = await laClient.pauseDownload(packId);
+      return result.paused ?? false;
+    } catch (err) {
+      console.error('Failed to pause download:', err);
+      return false;
+    }
+  }, []);
+
+  /**
+   * Resume a paused download
+   */
+  const resumeDownload = useCallback(async (packId: string): Promise<boolean> => {
+    try {
+      const result = await laClient.resumeDownload(packId);
+      return result.resumed ?? false;
+    } catch (err) {
+      console.error('Failed to resume download:', err);
+      return false;
+    }
+  }, []);
+
+  /**
+   * Cancel a download
+   */
+  const cancelDownload = useCallback(async (packId: string): Promise<boolean> => {
+    try {
+      const result = await laClient.cancelDownload(packId);
+      if (result.cancelled) {
+        // Refresh packs list after cancellation
+        refreshPacks();
+      }
+      return result.cancelled ?? false;
+    } catch (err) {
+      console.error('Failed to cancel download:', err);
+      return false;
+    }
+  }, [refreshPacks]);
+
   // Initial connection check
   useEffect(() => {
     checkConnection();
@@ -275,6 +409,12 @@ export function useLicensingAgent(): UseLicensingAgentReturn {
     refreshCatalog,
     requestPack,
     deletePack,
+    requestCustomPack,
+    estimatePackTiles,
+    getDownloadProgress,
+    pauseDownload,
+    resumeDownload,
+    cancelDownload,
   };
 }
 

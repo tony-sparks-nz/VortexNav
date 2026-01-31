@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import maplibregl, { LngLatBounds } from 'maplibre-gl';
-import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel, RoutePanel, RouteCreationOverlay, ChartBar, ImportProgressIndicator, NavigationModal, RouteNavigationModal, TrackPanel, DeviceRegistration, PackManager } from './components';
+import vortexNavLogo from './assets/vortexnav-logo.png';
+import { MapView, StatusBar, LayerSwitcher, GpsSettings, GpsStatusModal, WaypointPanel, RoutePanel, RouteCreationOverlay, ChartBar, DownloadedPackBar, ImportProgressIndicator, NavigationModal, RouteNavigationModal, TrackPanel, DeviceRegistration, PackManager, DownloadAreaOverlay } from './components';
 import type { ThemeMode, Vessel, BasemapProvider, ApiKeys, ImportProgress, GebcoSettings, GebcoStatus, Cm93Settings, Cm93Status, GeoJsonTile, NauticalChartSettings, NauticalChartStatus } from './types';
 import { DEFAULT_GEBCO_SETTINGS, DEFAULT_CM93_SETTINGS, TRACK_RECORDING_INTERVAL, TRACK_MIN_MOVEMENT_METERS } from './types';
 import {
@@ -27,6 +28,8 @@ import { useRouteManager } from './hooks/useRouteManager';
 import { useTrackManager } from './hooks/useTrackManager';
 import { useChartLayers } from './hooks/useChartLayers';
 import { useLicensingAgent } from './hooks/useLicensingAgent';
+import { useDownloadArea } from './hooks/useDownloadArea';
+import type { DownloadProgressResult } from './services/laClient';
 import { registerVortexProtocol } from './utils/vortexProtocol';
 import './App.css';
 
@@ -97,12 +100,76 @@ function App() {
   // Device registration, entitlements, and offline packs
   const licensingAgent = useLicensingAgent();
 
-  // Extract entitlement values for UI enforcement
-  const entitlementMaxZoom = useMemo(() => {
-    const ent = licensingAgent.entitlements.find(e => e.key === 'max_zoom_level');
-    if (ent && typeof ent.value === 'number') {
-      return ent.value;
+  // Track download progress for all downloading packs
+  const [downloadProgressMap, setDownloadProgressMap] = useState<Map<string, DownloadProgressResult>>(new Map());
+
+  // Get IDs of downloading packs (stable string for dependency)
+  const downloadingPackIds = useMemo(() => {
+    return licensingAgent.packs
+      .filter(p => p.status === 'downloading')
+      .map(p => p.id)
+      .join(',');
+  }, [licensingAgent.packs]);
+
+  // Poll for download progress of all downloading packs
+  useEffect(() => {
+    if (!downloadingPackIds) {
+      // No downloading packs - clear progress map
+      setDownloadProgressMap(new Map());
+      return;
     }
+
+    const packIds = downloadingPackIds.split(',');
+
+    const pollAllProgress = async () => {
+      const newProgress = new Map<string, DownloadProgressResult>();
+      for (const packId of packIds) {
+        try {
+          const progress = await licensingAgent.getDownloadProgress(packId);
+          if (progress) {
+            newProgress.set(packId, progress);
+            // If download completed or errored, refresh packs list
+            if (progress.status === 'ready' || progress.status === 'error') {
+              licensingAgent.refreshPacks();
+            }
+          }
+        } catch (err) {
+          console.error(`Failed to get progress for pack ${packId}:`, err);
+        }
+      }
+      setDownloadProgressMap(newProgress);
+    };
+
+    // Initial poll
+    pollAllProgress();
+
+    // Poll every second
+    const interval = setInterval(pollAllProgress, 1000);
+    return () => clearInterval(interval);
+  }, [downloadingPackIds, licensingAgent.getDownloadProgress, licensingAgent.refreshPacks]);
+
+  // Extract entitlement values for UI enforcement (before useDownloadArea so it can use maxZoom)
+  const entitlementMaxZoom = useMemo(() => {
+    console.log('[App] Computing entitlementMaxZoom. Entitlements:', licensingAgent.entitlements.length);
+    const ent = licensingAgent.entitlements.find(e => e.key === 'max_zoom_level');
+    console.log('[App] Found max_zoom_level entitlement:', ent);
+    if (ent) {
+      console.log('[App] max_zoom_level value:', ent.value, 'type:', typeof ent.value);
+      // Handle both number and string values (JSON parsing quirk)
+      if (typeof ent.value === 'number') {
+        console.log('[App] Returning number value:', ent.value);
+        return ent.value;
+      }
+      // If it's a string, try to parse it as a number
+      if (typeof ent.value === 'string') {
+        const parsed = parseInt(ent.value, 10);
+        if (!isNaN(parsed)) {
+          console.log('[App] Parsed string value to number:', parsed);
+          return parsed;
+        }
+      }
+    }
+    console.log('[App] No valid max_zoom_level found, returning null');
     return null; // No restriction (default to map's default maxZoom)
   }, [licensingAgent.entitlements]);
 
@@ -113,6 +180,12 @@ function App() {
     }
     return null; // No restriction
   }, [licensingAgent.entitlements]);
+
+  // ============ DOWNLOAD AREA STATE ============
+  // Custom offline area downloads - uses entitlement max zoom
+  const downloadArea = useDownloadArea({
+    maxZoomLimit: entitlementMaxZoom ?? 14,
+  });
 
   // Route navigation state - tracks current waypoint when navigating a route
   const [currentRouteWaypointIndex, setCurrentRouteWaypointIndex] = useState(0);
@@ -189,6 +262,20 @@ function App() {
   // Chart outline display state
   const [showChartOutlines, setShowChartOutlines] = useState(false);
   const [highlightedChartId, setHighlightedChartId] = useState<string | null>(null);
+
+  // Active downloaded pack for offline tile display
+  // When set, tiles from this pack are overlaid on the map
+  const [activeDownloadedPackId, setActiveDownloadedPackId] = useState<string | null>(null);
+
+  // Debug: log packs and active pack ID changes
+  useEffect(() => {
+    console.log('[App DEBUG] Packs updated:', licensingAgent.packs.length, 'packs');
+    console.log('[App DEBUG] Packs:', licensingAgent.packs.map(p => ({ id: p.id, hasBounds: !!p.bounds, bounds: p.bounds })));
+  }, [licensingAgent.packs]);
+
+  useEffect(() => {
+    console.log('[App DEBUG] activeDownloadedPackId changed:', activeDownloadedPackId);
+  }, [activeDownloadedPackId]);
 
   // Register vortex:// protocol for LA tile serving
   useEffect(() => {
@@ -744,7 +831,11 @@ function App() {
   return (
     <div className={`app app--${theme}`}>
       <header className="app__header">
-        <h1 className="app__title">VortexNav</h1>
+        <img
+          src={vortexNavLogo}
+          alt="VortexNav"
+          className="app__logo"
+        />
         <div className="app__header-controls">
           <button
             className="app__fullscreen-btn"
@@ -850,6 +941,15 @@ function App() {
           recordingTrackId={trackManager.state.recording.trackId}
           // Entitlement-based restrictions
           entitlementMaxZoom={entitlementMaxZoom}
+          // Download area drawing - show polygon during both drawing AND configuring phases
+          downloadAreaModeActive={downloadArea.state.isDrawing || downloadArea.state.isConfiguring}
+          downloadAreaDrawingActive={downloadArea.state.isDrawing}  // Click handlers only during drawing
+          downloadAreaPoints={downloadArea.state.polygonPoints}
+          onDownloadAreaClick={(lat, lon) => downloadArea.addPoint(lat, lon)}
+          onDownloadAreaDoubleClick={() => downloadArea.finishDrawing()}
+          // Offline pack tile display
+          activeDownloadedPackId={activeDownloadedPackId}
+          offlinePacks={licensingAgent.packs}
         />
 
         {/* Layers Button - top left, second in stack */}
@@ -925,7 +1025,26 @@ function App() {
           </svg>
         </button>
 
-        {/* Settings Button - top left, first in stack */}
+        {/* Download Area Button - top left, sixth in stack */}
+        <button
+          className={`download-btn ${downloadArea.isActive ? 'download-btn--active' : ''}`}
+          onClick={() => {
+            if (downloadArea.isActive) {
+              downloadArea.cancelDrawing();
+            } else {
+              downloadArea.startDrawing();
+            }
+          }}
+          title={downloadArea.isActive ? 'Cancel download area' : 'Download area for offline use'}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </button>
+
+        {/* Settings Button - top left, seventh in stack */}
         <button
           className="settings-btn"
           onClick={() => setShowGpsSettings(!showGpsSettings)}
@@ -936,6 +1055,41 @@ function App() {
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
           </svg>
         </button>
+
+        {/* Downloaded Pack Bar - shows downloaded offline areas */}
+        {licensingAgent.packs.filter(p => p.status === 'ready').length > 0 && (
+          <DownloadedPackBar
+            packs={licensingAgent.packs}
+            viewportBounds={viewportBounds}
+            currentZoom={currentZoom}
+            activePackId={activeDownloadedPackId}
+            onSelectPack={(packId) => {
+              console.log('[App] Selected downloaded pack:', packId);
+              const pack = packId ? licensingAgent.packs.find(p => p.id === packId) : null;
+              console.log('[App] Pack details:', pack ? { id: pack.id, bounds: pack.bounds, zoom_levels: pack.zoom_levels } : null);
+              // Test fetch to confirm this handler is called
+              if (packId) {
+                fetch(`http://127.0.0.1:47924/tiles/${packId}/6/0/0.png`)
+                  .then(r => console.log('[App] Pack selection test fetch:', r.status))
+                  .catch(e => console.error('[App] Pack selection test fetch error:', e));
+              }
+              setActiveDownloadedPackId(packId);
+              // When selecting a downloaded pack, hide all regular charts to avoid visual conflict
+              if (packId && !allChartsHidden) {
+                setAllChartsHidden(true);
+              }
+            }}
+            onZoomToPack={(packId) => {
+              const pack = licensingAgent.packs.find(p => p.id === packId);
+              if (pack?.bounds && mapRef.current) {
+                mapRef.current.fitBounds(
+                  [[pack.bounds.min_lon, pack.bounds.min_lat], [pack.bounds.max_lon, pack.bounds.max_lat]],
+                  { padding: 50, duration: 1000 }
+                );
+              }
+            }}
+          />
+        )}
 
         {/* Chart Selection Bar - shows charts overlapping current viewport */}
         {chartLayers.length > 0 && (
@@ -948,6 +1102,10 @@ function App() {
               // Highlight the clicked chart when outlines are shown
               if (showChartOutlines) {
                 setHighlightedChartId(chartId === highlightedChartId ? null : chartId);
+              }
+              // When enabling a chart, deselect downloaded pack to avoid conflicts
+              if (activeDownloadedPackId) {
+                setActiveDownloadedPackId(null);
               }
             }}
             allChartsHidden={allChartsHidden}
@@ -1112,6 +1270,105 @@ function App() {
         />
       )}
 
+      {/* Download Area Overlay - shows when drawing download area */}
+      {downloadArea.isActive && (
+        <DownloadAreaOverlay
+          theme={theme}
+          isDrawing={downloadArea.state.isDrawing}
+          polygonPoints={downloadArea.state.polygonPoints}
+          isConfiguring={downloadArea.state.isConfiguring}
+          downloadName={downloadArea.state.downloadName}
+          basemapId={downloadArea.state.basemapId}
+          minZoom={downloadArea.state.minZoom}
+          maxZoom={downloadArea.state.maxZoom}
+          maxZoomLimit={entitlementMaxZoom ?? 14}
+          estimatedTileCount={downloadArea.state.estimatedTileCount}
+          estimatedSizeBytes={downloadArea.state.estimatedSizeBytes}
+          isDownloading={downloadArea.state.isDownloading}
+          downloadProgress={downloadArea.state.downloadProgress}
+          downloadedTiles={downloadArea.state.downloadedTiles}
+          totalTiles={downloadArea.state.totalTiles}
+          downloadPhase={downloadArea.state.downloadPhase}
+          error={downloadArea.state.error}
+          rightPanelOpen={showWaypointPanel || showRoutePanel || showTrackPanel}
+          onNameChange={downloadArea.updateName}
+          onBasemapChange={downloadArea.updateBasemap}
+          onMinZoomChange={(zoom) => downloadArea.updateZoomRange(zoom, undefined)}
+          onMaxZoomChange={(zoom) => downloadArea.updateZoomRange(undefined, zoom)}
+          onUndo={downloadArea.removeLastPoint}
+          onCancel={downloadArea.cancelDrawing}
+          onFinishDrawing={downloadArea.finishDrawing}
+          onStartDownload={async () => {
+            // Use the hook's startDownload which properly manages loading state
+            const packId = await downloadArea.startDownload(async (bounds, zoomLevels, basemapId, name) => {
+              // Convert AOIBounds to CustomPackBounds format
+              const customBounds = {
+                min_lon: bounds.minLon,
+                min_lat: bounds.minLat,
+                max_lon: bounds.maxLon,
+                max_lat: bounds.maxLat,
+              };
+
+              const result = await licensingAgent.requestCustomPack(
+                customBounds,
+                zoomLevels,
+                basemapId,
+                name
+              );
+
+              return result?.pack_id ?? null;
+            });
+
+            // If download started, poll for progress
+            if (packId) {
+              console.warn('[App] Download started with packId:', packId, '- starting progress poll');
+              const pollProgress = async () => {
+                console.warn('[App] Polling progress for pack:', packId);
+                try {
+                  const progress = await licensingAgent.getDownloadProgress(packId);
+                  console.warn('[App] Progress result:', progress);
+                  if (progress) {
+                    downloadArea.updateProgress(
+                      progress.percent,
+                      progress.phase ?? null,
+                      progress.downloaded_tiles,
+                      progress.total_tiles
+                    );
+                    // Check final status
+                    if (progress.status === 'ready') {
+                      // Download complete!
+                      console.warn('[App] Download complete! Status: ready');
+                      downloadArea.dispatch({ type: 'DOWNLOAD_SUCCESS' });
+                      licensingAgent.refreshPacks();
+                    } else if (progress.status === 'error') {
+                      // Download failed
+                      console.warn('[App] Download failed with error status');
+                      downloadArea.dispatch({ type: 'DOWNLOAD_ERROR', payload: 'Download failed' });
+                      licensingAgent.refreshPacks();
+                    } else {
+                      // Still in progress (downloading or finalizing MBTiles)
+                      // Keep polling even at 100% until status changes to ready/error
+                      console.warn('[App] Still in progress (status:', progress.status, ', percent:', progress.percent, ') - polling again in 1s...');
+                      setTimeout(pollProgress, 1000);
+                    }
+                  } else {
+                    console.warn('[App] No progress result returned - retrying in 1s');
+                    setTimeout(pollProgress, 1000);
+                  }
+                } catch (err) {
+                  console.error('[App] Progress poll error:', err);
+                  setTimeout(pollProgress, 2000); // Retry after error
+                }
+              };
+              // Start polling
+              setTimeout(pollProgress, 500);
+            } else {
+              console.warn('[App] No packId returned from startDownload');
+            }
+          }}
+        />
+      )}
+
       {showLayerPanel && (
         <LayerSwitcher
           theme={theme}
@@ -1125,6 +1382,53 @@ function App() {
           gebcoStatus={gebcoStatus ?? undefined}
           nauticalSettings={nauticalSettings}
           nauticalStatus={nauticalStatus}
+          offlinePacks={licensingAgent.packs}
+          downloadProgress={downloadProgressMap}
+          onDeletePack={async (packId) => {
+            await licensingAgent.deletePack(packId);
+          }}
+          onPauseDownload={async (packId) => {
+            await licensingAgent.pauseDownload(packId);
+          }}
+          onResumeDownload={async (packId) => {
+            await licensingAgent.resumeDownload(packId);
+          }}
+          onCancelDownload={async (packId) => {
+            await licensingAgent.cancelDownload(packId);
+          }}
+          onZoomToPack={(packId) => {
+            const pack = licensingAgent.packs.find(p => p.id === packId);
+            if (pack?.bounds && mapRef.current) {
+              mapRef.current.fitBounds(
+                [[pack.bounds.min_lon, pack.bounds.min_lat], [pack.bounds.max_lon, pack.bounds.max_lat]],
+                { padding: 50, duration: 1000 }
+              );
+            }
+          }}
+          onExportPack={async (packId, packName) => {
+            try {
+              const { save } = await import('@tauri-apps/plugin-dialog');
+              const { exportPack, formatBytes } = await import('./services/laClient');
+
+              // Sanitize name for filename
+              const safeName = packName.replace(/[^a-zA-Z0-9\s-_]/g, '').trim() || 'pack';
+              const filePath = await save({
+                defaultPath: `${safeName}.mbtiles`,
+                filters: [{ name: 'MBTiles Files', extensions: ['mbtiles'] }],
+              });
+
+              if (filePath) {
+                const result = await exportPack(packId, filePath);
+                if (result.success) {
+                  console.log(`Pack exported successfully: ${formatBytes(result.size_bytes)}`);
+                  alert(`Pack exported successfully!\n\nSaved to: ${result.destination_path}\nSize: ${formatBytes(result.size_bytes)}`);
+                }
+              }
+            } catch (error) {
+              console.error('Failed to export pack:', error);
+              alert(`Failed to export pack: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }}
           onGebcoSettingsChange={handleGebcoSettingsChange}
           onNauticalSettingsChange={handleNauticalSettingsChange}
           onNauticalInitialize={handleCm93Initialize}

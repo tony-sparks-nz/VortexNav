@@ -196,12 +196,18 @@ pub struct Entitlement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackInfo {
     pub id: String,
-    pub region_slug: String,
+    #[serde(default)]
+    pub region_slug: Option<String>,  // Optional for custom packs
     pub name: String,
     pub status: String,
     pub tile_count: Option<u32>,
     pub size_bytes: Option<u64>,
     pub expires_at: String,
+    pub downloaded_at: Option<String>,
+    pub bounds: Option<PackBounds>,
+    pub zoom_levels: Option<Vec<u8>>,
+    pub provider: Option<String>,
+    pub storage_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +300,23 @@ pub async fn la_register_device(code: String) -> Result<RegistrationResult, Stri
     let response = client.send_request("device.register", serde_json::json!({ "code": code })).await?;
     serde_json::from_value(response)
         .map_err(|e| format!("Failed to parse registration result: {}", e))
+}
+
+/// Result of device reset
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetResult {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Reset device identity to allow re-registration
+#[tauri::command]
+pub async fn la_reset_device() -> Result<ResetResult, String> {
+    println!("[Tauri] la_reset_device called");
+    let client = get_client();
+    let response = client.send_request("device.reset", serde_json::json!({})).await?;
+    serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse reset result: {}", e))
 }
 
 /// Force sync with Horizon
@@ -392,4 +415,217 @@ pub async fn la_get_tile(z: u8, x: u32, y: u32, layer: Option<String>) -> Result
     let response = client.send_request("tile.get", params).await?;
     serde_json::from_value(response)
         .map_err(|e| format!("Failed to parse tile data: {}", e))
+}
+
+// ==============================================
+// Custom Pack (Download Area) Commands
+// ==============================================
+
+/// Custom pack request result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomPackResult {
+    pub pack_id: String,
+    pub status: String,
+    pub tile_count: u64,
+}
+
+/// Tile estimate result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileEstimateResult {
+    pub tile_count: u64,
+    pub estimated_size_bytes: u64,
+}
+
+/// Request a custom pack download for a user-defined area
+#[tauri::command]
+pub async fn la_request_custom_pack(
+    bounds: PackBounds,
+    zoom_levels: Vec<u8>,
+    basemap_id: String,
+    name: String,
+) -> Result<CustomPackResult, String> {
+    println!("[Tauri LA] la_request_custom_pack called");
+    println!("[Tauri LA]   bounds: {:?}", bounds);
+    println!("[Tauri LA]   zoom_levels: {:?}", zoom_levels);
+    println!("[Tauri LA]   basemap_id: {}", basemap_id);
+    println!("[Tauri LA]   name: {}", name);
+
+    let client = get_client();
+    let params = serde_json::json!({
+        "bounds": {
+            "min_lon": bounds.min_lon,
+            "min_lat": bounds.min_lat,
+            "max_lon": bounds.max_lon,
+            "max_lat": bounds.max_lat,
+        },
+        "zoom_levels": zoom_levels,
+        "basemap_id": basemap_id,
+        "name": name,
+    });
+
+    println!("[Tauri LA] Sending IPC request: pack.custom_request");
+    match client.send_request("pack.custom_request", params).await {
+        Ok(response) => {
+            println!("[Tauri LA] IPC response received: {:?}", response);
+            match serde_json::from_value::<CustomPackResult>(response.clone()) {
+                Ok(result) => {
+                    println!("[Tauri LA] Parsed result: {:?}", result);
+                    Ok(result)
+                }
+                Err(e) => {
+                    println!("[Tauri LA] Failed to parse response: {}", e);
+                    println!("[Tauri LA] Raw response was: {:?}", response);
+                    Err(format!("Failed to parse custom pack result: {}", e))
+                }
+            }
+        }
+        Err(e) => {
+            println!("[Tauri LA] IPC request FAILED: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Estimate tile count and size for a custom area
+#[tauri::command]
+pub async fn la_estimate_pack_tiles(
+    bounds: PackBounds,
+    zoom_levels: Vec<u8>,
+) -> Result<TileEstimateResult, String> {
+    let client = get_client();
+    let params = serde_json::json!({
+        "bounds": {
+            "min_lon": bounds.min_lon,
+            "min_lat": bounds.min_lat,
+            "max_lon": bounds.max_lon,
+            "max_lat": bounds.max_lat,
+        },
+        "zoom_levels": zoom_levels,
+    });
+    let response = client.send_request("pack.estimate_tiles", params).await?;
+    serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse tile estimate: {}", e))
+}
+
+/// Download progress result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgressResult {
+    pub pack_id: String,
+    pub total_tiles: u32,
+    pub downloaded_tiles: u32,
+    pub failed_tiles: u32,
+    pub percent: f32,
+    pub status: String,
+    #[serde(default)]
+    pub paused: bool,
+    pub eta_seconds: Option<u32>,
+    pub tiles_per_second: Option<f32>,
+}
+
+/// Get download progress for a pack
+#[tauri::command]
+pub async fn la_get_download_progress(pack_id: String) -> Result<DownloadProgressResult, String> {
+    println!("[Tauri] la_get_download_progress called for pack: {}", pack_id);
+    let client = get_client();
+    let response = client.send_request("pack.download_progress", serde_json::json!({ "pack_id": pack_id })).await?;
+    println!("[Tauri] la_get_download_progress response: {:?}", response);
+    let result: DownloadProgressResult = serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse download progress: {}", e))?;
+    println!("[Tauri] la_get_download_progress parsed: percent={}, status={}", result.percent, result.status);
+    Ok(result)
+}
+
+/// Pause download result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PauseResumeResult {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub resumed: bool,
+}
+
+/// Pause a download
+#[tauri::command]
+pub async fn la_pause_download(pack_id: String) -> Result<PauseResumeResult, String> {
+    println!("[Tauri] la_pause_download called for pack: {}", pack_id);
+    let client = get_client();
+    let response = client.send_request("pack.pause", serde_json::json!({ "pack_id": pack_id })).await?;
+    serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse pause result: {}", e))
+}
+
+/// Resume a paused download
+#[tauri::command]
+pub async fn la_resume_download(pack_id: String) -> Result<PauseResumeResult, String> {
+    println!("[Tauri] la_resume_download called for pack: {}", pack_id);
+    let client = get_client();
+    let response = client.send_request("pack.resume", serde_json::json!({ "pack_id": pack_id })).await?;
+    serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse resume result: {}", e))
+}
+
+/// Cancel download result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelResult {
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+/// Cancel a download
+#[tauri::command]
+pub async fn la_cancel_download(pack_id: String) -> Result<CancelResult, String> {
+    println!("[Tauri] la_cancel_download called for pack: {}", pack_id);
+    let client = get_client();
+    let response = client.send_request("pack.cancel", serde_json::json!({ "pack_id": pack_id })).await?;
+    serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse cancel result: {}", e))
+}
+
+/// Export pack result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportPackResult {
+    pub success: bool,
+    pub destination_path: String,
+    pub size_bytes: u64,
+}
+
+/// Minimal pack status for export (only fields we need)
+#[derive(Debug, Clone, Deserialize)]
+struct PackStatusForExport {
+    pub id: String,
+    pub storage_path: Option<String>,
+}
+
+/// Export a pack's MBTiles file to user-specified location
+#[tauri::command]
+pub async fn la_export_pack(pack_id: String, destination_path: String) -> Result<ExportPackResult, String> {
+    println!("[Tauri] la_export_pack called: pack_id={}, dest={}", pack_id, destination_path);
+
+    // First, get the pack info to find the storage path
+    let client = get_client();
+    let response = client.send_request("pack.status", serde_json::json!({ "pack_id": pack_id })).await?;
+    println!("[Tauri] pack.status response: {:?}", response);
+
+    let pack_status: PackStatusForExport = serde_json::from_value(response)
+        .map_err(|e| format!("Failed to parse pack status: {}", e))?;
+
+    let source_path = pack_status.storage_path
+        .ok_or_else(|| "Pack has no storage path - may not be downloaded yet".to_string())?;
+
+    println!("[Tauri] Copying from {} to {}", source_path, destination_path);
+
+    // Copy the file
+    let metadata = tokio::fs::metadata(&source_path).await
+        .map_err(|e| format!("Failed to read source file: {}", e))?;
+
+    tokio::fs::copy(&source_path, &destination_path).await
+        .map_err(|e| format!("Failed to copy file: {}", e))?;
+
+    println!("[Tauri] Export successful: {} bytes", metadata.len());
+
+    Ok(ExportPackResult {
+        success: true,
+        destination_path,
+        size_bytes: metadata.len(),
+    })
 }

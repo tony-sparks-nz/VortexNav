@@ -42,6 +42,11 @@ export interface PackInfo {
   tile_count?: number;
   size_bytes?: number;
   expires_at: string;
+  downloaded_at?: string;
+  bounds?: PackBounds;
+  zoom_levels?: number[];
+  provider?: string;
+  storage_path?: string;
 }
 
 export interface PackBounds {
@@ -102,6 +107,14 @@ export async function registerDevice(code: string): Promise<RegistrationResult> 
 }
 
 /**
+ * Reset device identity to allow re-registration
+ * WARNING: This clears all stored identity and entitlements
+ */
+export async function resetDevice(): Promise<{ success: boolean; message: string }> {
+  return await invoke<{ success: boolean; message: string }>('la_reset_device');
+}
+
+/**
  * Force sync with Horizon
  */
 export async function sync(): Promise<boolean> {
@@ -144,8 +157,8 @@ export async function requestPack(
   zoomLevels?: number[]
 ): Promise<{ pack_id: string; status: string }> {
   return await invoke<{ pack_id: string; status: string }>('la_request_pack', {
-    region_slug: regionSlug,
-    zoom_levels: zoomLevels,
+    regionSlug,  // camelCase for Tauri
+    zoomLevels,  // camelCase for Tauri
   });
 }
 
@@ -153,14 +166,14 @@ export async function requestPack(
  * Get pack status
  */
 export async function getPackStatus(packId: string): Promise<PackInfo> {
-  return await invoke<PackInfo>('la_get_pack_status', { pack_id: packId });
+  return await invoke<PackInfo>('la_get_pack_status', { packId });  // camelCase for Tauri
 }
 
 /**
  * Delete a pack
  */
 export async function deletePack(packId: string): Promise<boolean> {
-  return await invoke<boolean>('la_delete_pack', { pack_id: packId });
+  return await invoke<boolean>('la_delete_pack', { packId });  // camelCase for Tauri
 }
 
 /**
@@ -173,6 +186,169 @@ export async function getTile(
   layer?: string
 ): Promise<TileData> {
   return await invoke<TileData>('la_get_tile', { z, x, y, layer });
+}
+
+// ==============================================
+// Custom Pack (Download Area) API
+// ==============================================
+
+export interface CustomPackBounds {
+  min_lon: number;
+  min_lat: number;
+  max_lon: number;
+  max_lat: number;
+}
+
+export interface CustomPackRequest {
+  bounds: CustomPackBounds;
+  zoom_levels: number[];
+  basemap_id: string;
+  name: string;
+}
+
+export interface CustomPackResult {
+  pack_id: string;
+  status: string;
+  tile_count: number;
+}
+
+export interface TileEstimateResult {
+  tile_count: number;
+  estimated_size_bytes: number;
+}
+
+export interface DownloadProgressResult {
+  pack_id: string;
+  total_tiles: number;
+  downloaded_tiles: number;
+  failed_tiles: number;
+  percent: number;
+  status: string;
+  phase?: string; // "Downloading tiles", "Creating offline pack", "Storing to disk"
+  paused?: boolean;
+  eta_seconds?: number;  // Estimated time remaining in seconds
+  tiles_per_second?: number;  // Current download speed
+}
+
+/**
+ * Request a custom pack download for a user-defined area
+ */
+export async function requestCustomPack(
+  bounds: CustomPackBounds,
+  zoomLevels: number[],
+  basemapId: string,
+  name: string
+): Promise<CustomPackResult> {
+  console.log('[laClient] requestCustomPack called with:', {
+    bounds,
+    zoomLevels,
+    basemapId,
+    name,
+  });
+
+  try {
+    // Tauri expects camelCase parameter names from JavaScript
+    const result = await invoke<CustomPackResult>('la_request_custom_pack', {
+      bounds,
+      zoomLevels,  // camelCase for Tauri
+      basemapId,   // camelCase for Tauri
+      name,
+    });
+    console.log('[laClient] requestCustomPack success:', result);
+    return result;
+  } catch (error) {
+    console.error('[laClient] requestCustomPack FAILED:', error);
+    throw error;
+  }
+}
+
+/**
+ * Estimate tile count and size for a custom area
+ * (Can be used for preview before downloading)
+ */
+export async function estimatePackTiles(
+  bounds: CustomPackBounds,
+  zoomLevels: number[]
+): Promise<TileEstimateResult> {
+  return await invoke<TileEstimateResult>('la_estimate_pack_tiles', {
+    bounds,
+    zoomLevels,  // camelCase for Tauri
+  });
+}
+
+/**
+ * Get download progress for a pack
+ */
+export async function getDownloadProgress(
+  packId: string
+): Promise<DownloadProgressResult> {
+  console.warn('[laClient] getDownloadProgress called for pack:', packId);
+  const result = await invoke<DownloadProgressResult>('la_get_download_progress', {
+    packId,  // camelCase for Tauri
+  });
+  console.warn('[laClient] getDownloadProgress result:', result);
+  return result;
+}
+
+// ==============================================
+// Download Control (Pause/Resume/Cancel)
+// ==============================================
+
+export interface PauseResumeResult {
+  paused?: boolean;
+  resumed?: boolean;
+}
+
+export interface CancelResult {
+  cancelled?: boolean;
+}
+
+/**
+ * Pause a download
+ */
+export async function pauseDownload(packId: string): Promise<PauseResumeResult> {
+  console.log('[laClient] pauseDownload called for pack:', packId);
+  return await invoke<PauseResumeResult>('la_pause_download', { packId });
+}
+
+/**
+ * Resume a paused download
+ */
+export async function resumeDownload(packId: string): Promise<PauseResumeResult> {
+  console.log('[laClient] resumeDownload called for pack:', packId);
+  return await invoke<PauseResumeResult>('la_resume_download', { packId });
+}
+
+/**
+ * Cancel a download
+ */
+export async function cancelDownload(packId: string): Promise<CancelResult> {
+  console.log('[laClient] cancelDownload called for pack:', packId);
+  return await invoke<CancelResult>('la_cancel_download', { packId });
+}
+
+// ==============================================
+// Export Pack
+// ==============================================
+
+export interface ExportPackResult {
+  success: boolean;
+  destination_path: string;
+  size_bytes: number;
+}
+
+/**
+ * Export a pack's MBTiles file to user-specified location
+ */
+export async function exportPack(
+  packId: string,
+  destinationPath: string
+): Promise<ExportPackResult> {
+  console.log('[laClient] exportPack called:', packId, destinationPath);
+  return await invoke<ExportPackResult>('la_export_pack', {
+    packId,
+    destinationPath,
+  });
 }
 
 // ==============================================

@@ -156,6 +156,15 @@ interface MapViewProps {
   recordingTrackId?: number | null;
   // Entitlement-based zoom limit
   entitlementMaxZoom?: number | null;
+  // Download area drawing mode
+  downloadAreaModeActive?: boolean;  // Show polygon visual (drawing or configuring)
+  downloadAreaDrawingActive?: boolean;  // Enable click handlers (drawing only)
+  downloadAreaPoints?: { lat: number; lon: number }[];
+  onDownloadAreaClick?: (lat: number, lon: number) => void;
+  onDownloadAreaDoubleClick?: () => void;
+  // Offline pack tile display
+  activeDownloadedPackId?: string | null;
+  offlinePacks?: { id: string; bounds?: { min_lon: number; min_lat: number; max_lon: number; max_lat: number }; zoom_levels?: number[] }[];
 }
 
 // Waypoint symbol icons mapping
@@ -543,6 +552,15 @@ export function MapView({
   recordingTrackId,
   // Entitlement-based zoom limit
   entitlementMaxZoom,
+  // Download area drawing mode
+  downloadAreaModeActive = false,
+  downloadAreaDrawingActive = false,
+  downloadAreaPoints = [],
+  onDownloadAreaClick,
+  onDownloadAreaDoubleClick,
+  // Offline pack tile display
+  activeDownloadedPackId,
+  offlinePacks = [],
 }: MapViewProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -3492,6 +3510,231 @@ export function MapView({
       map.getCanvas().style.cursor = '';
     };
   }, [routeCreationModeActive, mapLoaded, onRouteCreationClick]);
+
+  // ============ DOWNLOAD AREA POLYGON DRAWING ============
+  // Handle clicks during download area mode to add polygon vertices
+  const downloadAreaMarkersRef = useRef<maplibregl.Marker[]>([]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded) return;
+
+    const map = mapRef.current;
+    const sourceId = 'download-area-source';
+    const fillLayerId = 'download-area-fill';
+    const outlineLayerId = 'download-area-outline';
+
+    // Remove existing layers
+    if (map.getLayer(fillLayerId)) map.removeLayer(fillLayerId);
+    if (map.getLayer(outlineLayerId)) map.removeLayer(outlineLayerId);
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+
+    // Remove existing markers
+    downloadAreaMarkersRef.current.forEach(marker => marker.remove());
+    downloadAreaMarkersRef.current = [];
+
+    if (!downloadAreaModeActive || downloadAreaPoints.length === 0) return;
+
+    // Add vertex markers
+    downloadAreaPoints.forEach((pt, index) => {
+      const el = document.createElement('div');
+      el.className = 'download-area-marker';
+      el.innerHTML = `<span class="download-area-marker__num">${index + 1}</span>`;
+
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+        .setLngLat([pt.lon, pt.lat])
+        .addTo(map);
+
+      downloadAreaMarkersRef.current.push(marker);
+    });
+
+    // Draw polygon if we have at least 2 points
+    if (downloadAreaPoints.length >= 2) {
+      const coordinates: [number, number][] = downloadAreaPoints.map(pt => [pt.lon, pt.lat]);
+      // Close the polygon by adding first point at the end
+      const closedCoords = [...coordinates, coordinates[0]];
+
+      map.addSource(sourceId, {
+        type: 'geojson',
+        data: {
+          type: 'Feature',
+          properties: {},
+          geometry: {
+            type: 'Polygon',
+            coordinates: [closedCoords],
+          },
+        },
+      });
+
+      // Semi-transparent fill
+      map.addLayer({
+        id: fillLayerId,
+        type: 'fill',
+        source: sourceId,
+        paint: {
+          'fill-color': '#3b82f6',
+          'fill-opacity': 0.15,
+        },
+      });
+
+      // Dashed outline
+      map.addLayer({
+        id: outlineLayerId,
+        type: 'line',
+        source: sourceId,
+        paint: {
+          'line-color': '#3b82f6',
+          'line-width': 2,
+          'line-dasharray': [4, 2],
+          'line-opacity': 0.8,
+        },
+      });
+    }
+
+    // Cleanup on unmount
+    return () => {
+      if (map.getLayer(fillLayerId)) map.removeLayer(fillLayerId);
+      if (map.getLayer(outlineLayerId)) map.removeLayer(outlineLayerId);
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+      downloadAreaMarkersRef.current.forEach(marker => marker.remove());
+      downloadAreaMarkersRef.current = [];
+    };
+  }, [downloadAreaModeActive, downloadAreaPoints, mapLoaded]);
+
+  // Handle map click during download area DRAWING mode only (not configuring)
+  useEffect(() => {
+    if (!mapRef.current || !mapLoaded || !downloadAreaDrawingActive) return;
+
+    const map = mapRef.current;
+
+    const handleClick = (e: maplibregl.MapMouseEvent) => {
+      onDownloadAreaClick?.(e.lngLat.lat, e.lngLat.lng);
+    };
+
+    const handleDblClick = (e: maplibregl.MapMouseEvent) => {
+      e.preventDefault();
+      onDownloadAreaDoubleClick?.();
+    };
+
+    map.on('click', handleClick);
+    map.on('dblclick', handleDblClick);
+
+    // Change cursor to crosshair during drawing mode
+    map.getCanvas().style.cursor = 'crosshair';
+
+    return () => {
+      map.off('click', handleClick);
+      map.off('dblclick', handleDblClick);
+      map.getCanvas().style.cursor = '';
+    };
+  }, [downloadAreaDrawingActive, mapLoaded, onDownloadAreaClick, onDownloadAreaDoubleClick]);
+
+  // ============ OFFLINE PACK TILE LAYER ============
+  // Display tiles from downloaded offline packs via the LA tile server
+  useEffect(() => {
+    console.log('[MapView] Offline pack useEffect triggered:', { activeDownloadedPackId, mapLoaded, offlinePacksCount: offlinePacks.length });
+
+    if (!mapRef.current || !mapLoaded) {
+      console.log('[MapView] Early return: mapRef or mapLoaded not ready');
+      return;
+    }
+
+    const map = mapRef.current;
+    const sourceId = 'offline-pack-tiles';
+    const layerId = 'offline-pack-layer';
+
+    // Remove existing layer and source
+    if (map.getLayer(layerId)) {
+      map.removeLayer(layerId);
+    }
+    if (map.getSource(sourceId)) {
+      map.removeSource(sourceId);
+    }
+
+    // If no pack is active, we're done
+    if (!activeDownloadedPackId) {
+      console.log('[MapView] No active pack, layer removed');
+      return;
+    }
+
+    // Find the active pack to get its bounds and zoom levels
+    const activePack = offlinePacks.find(p => p.id === activeDownloadedPackId);
+    console.log('[MapView] Found active pack:', activePack ? { id: activePack.id, bounds: activePack.bounds, zoom_levels: activePack.zoom_levels } : 'NOT FOUND');
+    console.log('[MapView] Available packs:', offlinePacks.map(p => ({ id: p.id, hasBounds: !!p.bounds })));
+    if (!activePack) {
+      console.log('[MapView] Active pack not found in offlinePacks');
+      return;
+    }
+
+    const minZoom = activePack.zoom_levels ? Math.min(...activePack.zoom_levels) : 0;
+    const maxZoom = activePack.zoom_levels ? Math.max(...activePack.zoom_levels) : 22;
+
+    // Add the tile source from the LA tile server
+    // Using pack-specific endpoint for better performance
+    try {
+      const tileUrl = `http://127.0.0.1:47924/tiles/${activeDownloadedPackId}/{z}/{x}/{y}.png`;
+      console.log('[MapView] Adding source with URL:', tileUrl);
+      console.log('[MapView] Source config:', { minZoom, maxZoom, bounds: activePack.bounds });
+
+      // Note: Not specifying bounds - let MapLibre request tiles for the whole viewport
+      // and the tile server will return 404 for tiles outside the pack
+      map.addSource(sourceId, {
+        type: 'raster',
+        tiles: [tileUrl],
+        tileSize: 256,
+        minzoom: minZoom,
+        maxzoom: maxZoom,
+        // bounds removed to allow MapLibre to request all tiles
+      });
+      console.log('[MapView] Source added successfully');
+    } catch (e) {
+      console.error('[MapView] Error adding source:', e);
+      return;
+    }
+
+    // Add the layer ON TOP of everything (no beforeLayer = add last = on top)
+    try {
+      map.addLayer({
+        id: layerId,
+        type: 'raster',
+        source: sourceId,
+        paint: {
+          'raster-opacity': 1,
+        },
+      });
+      console.log('[MapView] Layer added on top of all layers');
+
+      // Force MapLibre to re-render
+      map.triggerRepaint();
+
+      // Log all layers to see the order
+      const layers = map.getStyle()?.layers;
+      console.log('[MapView] Layer order:', layers?.map(l => l.id).slice(-5));
+    } catch (e) {
+      console.error('[MapView] Error adding layer:', e);
+      return;
+    }
+
+    console.log('[MapView] Added offline pack layer:', activeDownloadedPackId, { minZoom, maxZoom, bounds: activePack.bounds });
+
+    // Test fetch to verify the layer setup is working - use z=13 tiles that exist in the pack
+    fetch(`http://127.0.0.1:47924/tiles/${activeDownloadedPackId}/13/8125/4505.png`)
+      .then(r => console.log('[MapView] Test tile fetch status:', r.status, 'bytes:', r.headers.get('content-length')))
+      .catch(e => console.error('[MapView] Test tile fetch error:', e));
+
+    // Debug: Check if source and layer were added
+    console.log('[MapView] Source exists:', !!map.getSource(sourceId));
+    console.log('[MapView] Layer exists:', !!map.getLayer(layerId));
+    console.log('[MapView] All layers:', map.getStyle()?.layers?.map(l => l.id));
+
+    return () => {
+      if (map.getLayer(layerId)) {
+        map.removeLayer(layerId);
+      }
+      if (map.getSource(sourceId)) {
+        map.removeSource(sourceId);
+      }
+    };
+  }, [activeDownloadedPackId, offlinePacks, mapLoaded]);
 
   // ============ SELECTED ROUTE WAYPOINT MARKERS ============
   // Show numbered markers for waypoints when a route is selected/being edited

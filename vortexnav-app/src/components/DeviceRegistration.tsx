@@ -738,10 +738,8 @@ export function DeviceRegistration({ theme, onClose, onRegistered }: DeviceRegis
                 if (Array.isArray(value)) {
                   // Format array values (like allowed_basemaps)
                   if (entitlement.key === 'allowed_basemaps') {
-                    // Show count and list of basemap names
-                    const basemapNames = value.map(b => BASEMAP_NAMES[b] || b);
+                    // Show count of allowed basemaps
                     displayValue = `${value.length} sources`;
-                    // We'll show a tooltip or expanded view with full list
                   } else {
                     displayValue = value.length > 0 ? value.join(', ') : 'None';
                   }
